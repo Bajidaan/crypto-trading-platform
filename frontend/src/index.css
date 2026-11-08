@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+@theme {
+  --color-darkbg: #0a0d14;
+  --color-darkpanel: #111622;
+  --color-darkcard: #161c2b;
+  --color-darkborder: #232c40;
+  --color-brandgreen: #00c087;
+  --color-brandred: #f6465d;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background-color: #0a0d14;
+  color: #e2e8f0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  overflow-x: hidden;
+}
+
+/* Custom scrollbars for trading terminal panels */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0d14;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #232c40;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3b82f6;
+}
+
+@layer utilities {
+  .bg-darkbg {
+    background-color: #0a0d14;
+  }
+  .bg-darkpanel {
+    background-color: #111622;
+  }
+  .bg-darkcard {
+    background-color: #161c2b;
+  }
+  .border-darkborder {
+    border-color: #232c40;
+  }
+}
