@@ -9,42 +9,49 @@ A high-performance, single-tenant algorithmic trading system engineered for **Bi
 ```mermaid
 flowchart TD
     subgraph Frontend ["Web Dashboard (React + TypeScript + Vite)"]
-        UI_Head[Header & Global Circuit Breakers]
-        UI_Chart[TradingView Lightweight Chart]
-        UI_Pos[Positions & Risk Table]
-        UI_Ord[Order Lifecycle Table]
-        UI_Strat[Strategy Panel & Backtester]
-        UI_Feed[Live Audit & Risk Alerts Feed]
-        UI_WS[WebSocket Stream Client]
+        UI_Head["Header & Global Circuit Breakers"]
+        UI_Chart["TradingView Lightweight Chart"]
+        UI_Pos["Positions & Risk Table"]
+        UI_Ord["Order Lifecycle Table"]
+        UI_Strat["Strategy Panel & Backtester"]
+        UI_Feed["Live Audit & Risk Alerts Feed"]
+        UI_WS["WebSocket Stream Client"]
     end
 
     subgraph Gateway ["FastAPI Gateway (:8000)"]
-        REST_API[REST API /api/v1]
-        WS_HUB[WebSocket Broadcast Hub /ws/stream]
-        SEC_AUTH[HMAC Webhook Receiver]
+        REST_API["REST API /api/v1"]
+        WS_HUB["WebSocket Broadcast Hub /ws/stream"]
+        SEC_AUTH["HMAC Webhook Receiver"]
     end
 
     subgraph CoreEngine ["Asynchronous Trading Engine"]
-        BUS[In-Memory Async EventBus]
-        RISK[Risk Gatekeeper & Circuit Breakers]
-        SIZER[Fixed Fractional Position Sizer]
-        STRATS[Strategies: EMA/RSI, Bollinger Breakout, Smart DCA]
-        SLTP[Hybrid SL/TP Manager (Airbag + Trailing)]
-        PAPER[Paper Trading Broker Simulation]
-        LIVE[Live Exchange Broker with Idempotency]
-        VAULT[Hardware-Derived AES-256-GCM Vault]
+        BUS["In-Memory Async EventBus"]
+        RISK["Risk Gatekeeper & Circuit Breakers"]
+        SIZER["Fixed Fractional Position Sizer"]
+        STRATS["Strategies: EMA/RSI, Bollinger Breakout, Smart DCA"]
+        SLTP["Hybrid SL/TP Manager (Airbag + Trailing)"]
+        PAPER["Paper Trading Broker Simulation"]
+        LIVE["Live Exchange Broker with Idempotency"]
+        VAULT["Hardware-Derived AES-256-GCM Vault"]
     end
 
     subgraph Exchanges ["Exchange Connectors (CCXT / REST / WS)"]
-        BINANCE[Binance Spot & USDT-M Futures]
-        BYBIT[Bybit V5 Linear Futures]
+        BINANCE["Binance Spot & USDT-M Futures"]
+        BYBIT["Bybit V5 Linear Futures"]
     end
 
-    UI_WS <-->|ws://localhost:8000/ws/stream| WS_HUB
-    Frontend <-->|HTTP /api/v1| REST_API
-    REST_API --> CoreEngine
+    UI_WS <-->|"ws://localhost:8000/ws/stream"| WS_HUB
+    UI_Head <-->|"HTTP /api/v1"| REST_API
+    REST_API --> BUS
     WS_HUB --> BUS
-    CoreEngine <--> Exchanges
+    BUS --> RISK
+    RISK --> SIZER
+    SIZER --> STRATS
+    STRATS --> SLTP
+    SLTP --> PAPER
+    SLTP --> LIVE
+    LIVE <--> BINANCE
+    LIVE <--> BYBIT
 ```
 
 ---
@@ -81,6 +88,12 @@ npm run dev
 npm run build
 ```
 The Web Dashboard runs at `http://localhost:5173`.
+
+### 4. Docker Quickstart (24/7 Cloud Host or Local)
+```bash
+docker compose up -d
+```
+The Web Dashboard is served on port 80 at `http://localhost` (or `http://<your-vps-ip>`) with automatic REST API and WebSocket reverse-proxying.
 
 ---
 
