@@ -79,13 +79,19 @@ class WebSocketHub:
             elif isinstance(event, PositionUpdatedEvent):
                 payload["type"] = "POSITION"
                 payload["data"] = {
+                    "id": event.position_id,
                     "position_id": event.position_id,
                     "symbol": event.symbol,
                     "side": event.side.value,
                     "status": event.status.value,
                     "current_qty": float(event.current_qty),
                     "entry_price": float(event.entry_price),
-                    "realized_pnl": float(event.realized_pnl_usd),
+                    "current_price": float(event.current_price),
+                    "unrealized_pnl_usd": float(event.unrealized_pnl_usd),
+                    "unrealized_pnl_pct": event.unrealized_pnl_pct,
+                    "realized_pnl_usd": float(event.realized_pnl_usd),
+                    "exit_reason": event.exit_reason,
+                    "stop_loss_price": float(event.stop_loss_price) if event.stop_loss_price else None,
                 }
             elif isinstance(event, RiskAlertEvent):
                 payload["type"] = "RISK_ALERT"

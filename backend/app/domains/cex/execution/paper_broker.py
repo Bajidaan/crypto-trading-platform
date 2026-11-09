@@ -287,6 +287,7 @@ class PaperTradingBroker:
                     execution_mode=ExecutionMode.PAPER,
                     side=pos.side,
                     status=PositionStatus.OPEN,
+                    current_price=pos.current_price,
                     current_qty=pos.current_qty,
                     entry_price=pos.entry_price,
                     stop_loss_price=pos.stop_loss_price,
@@ -351,6 +352,10 @@ class PaperTradingBroker:
                 pos.current_price = close
                 pos.unrealized_pnl = gross_unrealized
 
+                # Pre-compute unrealized PnL % for display (leverage-adjusted)
+                notional = pos.entry_price * pos.current_qty
+                pnl_pct = float(gross_unrealized / notional * 100 * pos.leverage) if notional > 0 else 0.0
+
                 if self._session_factory is not None:
                     try:
                         from sqlalchemy import select
@@ -374,11 +379,13 @@ class PaperTradingBroker:
                         execution_mode=ExecutionMode.PAPER,
                         side=pos.side,
                         status=PositionStatus.OPEN,
+                        current_price=close,
                         current_qty=pos.current_qty,
                         entry_price=pos.entry_price,
                         stop_loss_price=pos.stop_loss_price,
                         stop_order_live=pos.stop_order_live,
                         unrealized_pnl_usd=gross_unrealized,
+                        unrealized_pnl_pct=pnl_pct,
                     )
                 )
 

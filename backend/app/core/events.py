@@ -118,10 +118,12 @@ class PositionUpdatedEvent(DomainEvent):
     side: PositionSide
     status: PositionStatus
     entry_price: Decimal
+    current_price: Decimal = Decimal("0")  # Live mark price for UI display
     current_qty: Decimal
     stop_loss_price: Decimal | None = None
     stop_order_live: bool = False
     unrealized_pnl_usd: Decimal = Decimal("0")
+    unrealized_pnl_pct: float = 0.0  # Pre-computed % for UI display
     realized_pnl_usd: Decimal = Decimal("0")
     exit_reason: str | None = None
 

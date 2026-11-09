@@ -72,17 +72,22 @@ export const App: React.FC = () => {
     wsService.connect();
     const unsubStatus = wsService.onStatusChange(setWsStatus);
 
-    // Subscriptions
+    // Subscriptions — WebSocket updates mark price and PnL in real-time
     const unsubPositions = wsService.subscribe('position', (msg) => {
       if (msg.data) {
+        // Map backend field name `position_id` to frontend `id` as well
+        const patch = { ...msg.data, id: msg.data.id || msg.data.position_id };
         setPositions((prev) => {
-          const idx = prev.findIndex((p) => p.id === msg.data.id);
+          const idx = prev.findIndex(
+            (p) => p.id === patch.id || p.id === patch.position_id,
+          );
           if (idx >= 0) {
             const next = [...prev];
-            next[idx] = { ...next[idx], ...msg.data };
+            next[idx] = { ...next[idx], ...patch };
             return next;
           }
-          return [msg.data, ...prev];
+          // New position arrived via WS — add it
+          return [patch, ...prev];
         });
       }
     });
@@ -114,9 +119,11 @@ export const App: React.FC = () => {
       }
     });
 
-    // Periodic status refresh
+    // Periodic full refresh: status every 5s, positions every 5s (live mark price fallback)
     const interval = setInterval(() => {
       api.getSystemStatus().then(setStatus).catch(() => {});
+      // Full positions REST poll — guarantees mark price updates even without WS
+      api.getPositions().then(setPositions).catch(() => {});
     }, 5000);
 
     return () => {
