@@ -127,6 +127,13 @@ class WebSocketClient {
     if (topicSet) {
       topicSet.forEach((fn) => fn(msg));
     }
+    // Also notify listeners matching message type (e.g. 'kline', 'candle', 'position')
+    if (msg.type) {
+      const typeSet = this.subscribers.get(msg.type.toLowerCase());
+      if (typeSet && typeSet !== topicSet) {
+        typeSet.forEach((fn) => fn(msg));
+      }
+    }
     // Notify wildcard listeners
     const starSet = this.subscribers.get('*');
     if (starSet) {

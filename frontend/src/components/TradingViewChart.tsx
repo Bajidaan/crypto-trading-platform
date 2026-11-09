@@ -115,38 +115,55 @@ export const TradingViewChart: React.FC<ChartProps> = ({
       return;
     }
 
-    // Fetch initial candles
+    // Fetch initial candles with periodic 5s background sync for live prices
     setLoading(true);
-    api
-      .getCandles(symbol, timeframe, 150)
-      .then((data: OHLCVCandle[]) => {
-        if (!isMounted) return;
-        if (data.length > 0) {
-          const sorted = [...data].sort((a, b) => a.time - b.time);
-          const candleData = sorted.map((c) => ({
-            time: c.time as any,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-          }));
-          candleSeries.setData(candleData);
-          volumeSeries.setData(
-            sorted.map((c) => ({
+    let isFirstLoad = true;
+
+    const fetchCandles = () => {
+      api
+        .getCandles(symbol, timeframe, 150)
+        .then((data: OHLCVCandle[]) => {
+          if (!isMounted) return;
+          if (data.length > 0) {
+            const sorted = [...data].sort((a, b) => a.time - b.time);
+            const candleData = sorted.map((c) => ({
+              time: c.time as any,
+              open: c.open,
+              high: c.high,
+              low: c.low,
+              close: c.close,
+            }));
+            const volumeData = sorted.map((c) => ({
               time: c.time as any,
               value: c.volume,
               color: c.close >= c.open ? 'rgba(0, 192, 135, 0.3)' : 'rgba(246, 70, 93, 0.3)',
-            }))
-          );
-          setLastPrice(sorted[sorted.length - 1].close);
-          chart.timeScale().fitContent();
-        }
-        setLoading(false);
-      })
-      .catch((err) => {
-        console.error('Failed to fetch candles:', err);
-        setLoading(false);
-      });
+            }));
+
+            if (isFirstLoad) {
+              candleSeries.setData(candleData);
+              volumeSeries.setData(volumeData);
+              chart.timeScale().fitContent();
+              isFirstLoad = false;
+            } else {
+              // Update last 2 candles incrementally without resetting user zoom
+              for (let i = Math.max(0, candleData.length - 2); i < candleData.length; i++) {
+                candleSeries.update(candleData[i]);
+                volumeSeries.update(volumeData[i]);
+              }
+            }
+            const latest = sorted[sorted.length - 1];
+            setLastPrice(latest.close);
+          }
+          setLoading(false);
+        })
+        .catch((err) => {
+          console.error('Failed to fetch candles:', err);
+          setLoading(false);
+        });
+    };
+
+    fetchCandles();
+    const pollInterval = setInterval(fetchCandles, 5000);
 
     // Handle container resize
     const handleResize = () => {
@@ -160,6 +177,7 @@ export const TradingViewChart: React.FC<ChartProps> = ({
 
     return () => {
       isMounted = false;
+      clearInterval(pollInterval);
       window.removeEventListener('resize', handleResize);
       chart.remove();
       chartRef.current = null;
@@ -168,28 +186,36 @@ export const TradingViewChart: React.FC<ChartProps> = ({
 
   // Subscribe to real-time websocket updates
   useEffect(() => {
-    const unsubscribe = wsService.subscribe('candle', (msg) => {
+    const handleCandleUpdate = (msg: any) => {
       if (msg.data?.symbol === symbol && candleSeriesRef.current && volumeSeriesRef.current) {
         const c = msg.data;
-        const timeSec = Math.floor(new Date(c.timestamp).getTime() / 1000);
-        candleSeriesRef.current.update({
-          time: timeSec as any,
-          open: Number(c.open),
-          high: Number(c.high),
-          low: Number(c.low),
-          close: Number(c.close),
-        });
-        volumeSeriesRef.current.update({
-          time: timeSec as any,
-          value: Number(c.volume),
-          color: Number(c.close) >= Number(c.open) ? 'rgba(0, 192, 135, 0.3)' : 'rgba(246, 70, 93, 0.3)',
-        });
-        setLastPrice(Number(c.close));
+        const timeSec = typeof c.time === 'number' ? c.time : Math.floor(new Date(c.timestamp || c.time).getTime() / 1000);
+        if (!isNaN(timeSec)) {
+          candleSeriesRef.current.update({
+            time: timeSec as any,
+            open: Number(c.open),
+            high: Number(c.high),
+            low: Number(c.low),
+            close: Number(c.close),
+          });
+          volumeSeriesRef.current.update({
+            time: timeSec as any,
+            value: Number(c.volume),
+            color: Number(c.close) >= Number(c.open) ? 'rgba(0, 192, 135, 0.3)' : 'rgba(246, 70, 93, 0.3)',
+          });
+        }
+        if (c.close) {
+          setLastPrice(Number(c.close));
+        }
       }
-    });
+    };
+
+    const unsubCandle = wsService.subscribe('candle', handleCandleUpdate);
+    const unsubKline = wsService.subscribe('kline', handleCandleUpdate);
 
     return () => {
-      unsubscribe();
+      unsubCandle();
+      unsubKline();
     };
   }, [symbol]);
 

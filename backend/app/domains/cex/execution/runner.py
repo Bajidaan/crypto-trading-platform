@@ -27,6 +27,7 @@ from app.domains.cex.strategies.base import IStrategy
 from app.domains.cex.strategies.registry import StrategyRegistry
 from app.models.entities import ExchangeConnection, StrategyConfig
 from app.models.enums import (
+    ExchangeId,
     ExecutionMode,
     MarketType,
     OrderPurpose,
@@ -205,6 +206,23 @@ class ContinuousStrategyRunner:
             high=latest_candle.high,
             low=latest_candle.low,
             close=latest_candle.close,
+        )
+
+        # 3b. Broadcast live candle event for dashboard charts and ticker displays
+        await self.event_bus.publish(
+            MarketCandleEvent(
+                exchange_id=ExchangeId.BINANCE,
+                symbol=symbol,
+                market_type=market_type,
+                timeframe=timeframe,
+                open_time=latest_candle.open_time,
+                open=latest_candle.open,
+                high=latest_candle.high,
+                low=latest_candle.low,
+                close=latest_candle.close,
+                volume=latest_candle.volume,
+                is_closed=latest_candle.is_closed,
+            )
         )
 
         # 4. Evaluate strategy on latest CLOSED candle (candles[-1] is still in progress)

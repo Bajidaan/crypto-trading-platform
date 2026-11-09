@@ -54,10 +54,12 @@ class WebSocketHub:
 
             if isinstance(event, MarketCandleEvent):
                 payload["type"] = "KLINE"
+                payload["topic"] = "candle"
                 payload["data"] = {
                     "symbol": event.symbol,
                     "timeframe": event.timeframe,
                     "time": int(event.open_time.timestamp()),
+                    "timestamp": event.open_time.isoformat(),
                     "open": float(event.open),
                     "high": float(event.high),
                     "low": float(event.low),

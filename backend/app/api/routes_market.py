@@ -26,12 +26,9 @@ async def get_candles(
     db: AsyncSession = Depends(get_db_session),
 ) -> list[dict[str, Any]]:
     m_type = MarketType(market_type.upper().strip())
-    # 1. Check in-memory stream buffer first
     buf = stream_manager.get_or_create_buffer(ExchangeId.BINANCE, symbol, timeframe, m_type)
-    if buf.count >= min(limit, 50):
-        return buf.to_dict_list()
 
-    # 2. Fetch fresh historical bars from exchange
+    # Fetch fresh historical bars from exchange
     conn_stmt = select(ExchangeConnection).where(ExchangeConnection.is_enabled == True).limit(1)
     conn = (await db.execute(conn_stmt)).scalar_one_or_none()
 
@@ -45,8 +42,10 @@ async def get_candles(
         buf.load_history(bars)
         return buf.to_dict_list()
     except Exception as exc:
+        # Fallback to buffer if live fetch fails
+        if buf.count > 0:
+            return buf.to_dict_list()
         # Fallback to simulated historical bars if external exchange connection is unreachable
-        if buf.count == 0:
             import time
             from datetime import datetime, timezone
             from decimal import Decimal

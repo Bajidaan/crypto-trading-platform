@@ -98,7 +98,8 @@ export interface RiskAlertItem {
 
 export interface WsMessage<T = any> {
   topic: string;
-  event: string;
+  type?: string;
+  event?: string;
   data: T;
   timestamp: string;
 }
