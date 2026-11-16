@@ -76,7 +76,7 @@ class TradeSignalEvent(DomainEvent):
     source: SignalSource
     exchange_id: ExchangeId = ExchangeId.BINANCE
     market_type: MarketType = MarketType.FUTURES_USDT
-    execution_mode: ExecutionMode = ExecutionMode.PAPER
+    execution_mode: ExecutionMode = ExecutionMode.DEMO
     symbol: str
     side: PositionSide
     # ENTRY opens a position on `side`; EXIT closes the strategy's open position on `side`.

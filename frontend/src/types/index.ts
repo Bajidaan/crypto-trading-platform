@@ -1,11 +1,20 @@
+// DEMO = Binance Demo Trading (demo funds); LIVE = the real Binance account.
+export type TradingEnvironment = 'DEMO' | 'LIVE';
+
 export interface SystemStatus {
   is_paused: boolean;
   kill_switch_active: boolean;
   max_concurrent_positions: number;
   max_daily_drawdown_pct: number;
   max_leverage_cap: number;
-  open_paper_positions: number;
-  total_paper_equity: number;
+  environment: TradingEnvironment;
+  connection_label: string | null;
+  equity_usd: number | null;
+  balances: Record<string, { total_equity: number; available_balance: number; unrealized_pnl: number }>;
+  balance_error: string | null;
+  balance_updated_at: string | null;
+  open_positions: number;
+  other_environment_open_positions: number;
   active_stream_subscriptions: number;
   event_bus_published_count: number;
 }
@@ -14,7 +23,7 @@ export interface PositionItem {
   id: string;
   symbol: string;
   market_type: string;
-  execution_mode: 'PAPER' | 'LIVE';
+  execution_mode: TradingEnvironment | 'PAPER';
   side: 'LONG' | 'SHORT';
   entry_price: number;
   current_price: number;
@@ -56,7 +65,8 @@ export interface StrategyItem {
   id: string;
   name: string;
   strategy_class: string;
-  execution_mode: 'PAPER' | 'LIVE';
+  // Legacy field: strategies now trade on the app's active environment.
+  execution_mode?: string;
   exchange_connection_id: string | null;
   market_type: string;
   symbols: string[];
@@ -72,6 +82,7 @@ export interface ConnectionItem {
   exchange_id: 'BINANCE' | 'BYBIT';
   label: string;
   api_key_masked: string;
+  environment: TradingEnvironment;
   is_testnet: boolean;
   is_active: boolean;
   spot_capital_cap_usd: number | null;

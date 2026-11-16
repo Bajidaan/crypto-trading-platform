@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import false as sa_false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -32,6 +33,7 @@ from app.models.enums import (
     PositionStatus,
     SignalSource,
     SignalStatus,
+    TradingEnvironment,
 )
 
 
@@ -55,7 +57,11 @@ class ExchangeConnection(Base):
     api_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     api_secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     passphrase_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
-    is_testnet: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # DEMO = Binance Demo Trading keys (made on demo.binance.com); LIVE = real account keys.
+    environment: Mapped[str] = mapped_column(
+        String(8), default=TradingEnvironment.DEMO.value, server_default=TradingEnvironment.DEMO.value,
+        nullable=False, index=True,
+    )
     spot_capital_cap_usd: Mapped[Decimal] = mapped_column(
         ExactDecimal(28, 12), default=Decimal("1000.0"), nullable=False
     )
@@ -69,10 +75,23 @@ class ExchangeConnection(Base):
         DateTime(timezone=True), default=_utc_now, onupdate=_utc_now, nullable=False
     )
 
-    strategies: Mapped[list["StrategyConfig"]] = relationship(
-        back_populates="exchange_connection", cascade="all, delete-orphan"
-    )
+    # No delete cascade: removing an API key must never delete strategies (their foreign key
+    # is simply cleared). It used to be "all, delete-orphan", which deleted them.
+    strategies: Mapped[list["StrategyConfig"]] = relationship(back_populates="exchange_connection")
     positions: Mapped[list["Position"]] = relationship(back_populates="exchange_connection")
+
+    @property
+    def is_demo(self) -> bool:
+        return self.environment == TradingEnvironment.DEMO.value
+
+    # Older code and API clients speak of "testnet"; it now means Binance Demo Trading.
+    @property
+    def is_testnet(self) -> bool:
+        return self.is_demo
+
+    @is_testnet.setter
+    def is_testnet(self, value: bool) -> None:
+        self.environment = (TradingEnvironment.DEMO if value else TradingEnvironment.LIVE).value
 
 
 class StrategyConfig(Base):
@@ -83,6 +102,8 @@ class StrategyConfig(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     strategy_class: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    # Unused since the paper simulator was removed: strategies trade on the app's active
+    # environment (DEMO or LIVE). Kept for existing rows and API compatibility.
     execution_mode: Mapped[str] = mapped_column(
         String(20), default=ExecutionMode.PAPER.value, nullable=False
     )
@@ -97,6 +118,11 @@ class StrategyConfig(Base):
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     risk_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Hidden strategies are kept (their positions and history stay intact) but are left out of
+    # the strategy list and can never be active.
+    is_hidden: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa_false(), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, onupdate=_utc_now, nullable=False
@@ -152,7 +178,7 @@ class Position(Base):
         String(36), ForeignKey("signals.id", ondelete="SET NULL"), nullable=True, unique=True
     )
     execution_mode: Mapped[str] = mapped_column(
-        String(20), default=ExecutionMode.PAPER.value, nullable=False, index=True
+        String(20), default=ExecutionMode.DEMO.value, nullable=False, index=True
     )
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     market_type: Mapped[str] = mapped_column(String(24), nullable=False)
@@ -339,6 +365,11 @@ class GlobalRiskState(Base):
         ExactDecimal(10, 4), default=Decimal("1.0"), nullable=False
     )
     compounding_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # The environment new trades go to; switched from the dashboard.
+    active_environment: Mapped[str] = mapped_column(
+        String(8), default=TradingEnvironment.DEMO.value, server_default=TradingEnvironment.DEMO.value,
+        nullable=False,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, onupdate=_utc_now, nullable=False
     )

@@ -6,26 +6,42 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_adapter_factory, get_db_session, get_paper_broker
-from app.domains.cex.adapters.factory import ExchangeAdapterFactory
-from app.domains.cex.execution.paper_broker import PaperTradingBroker
-from app.models.entities import ExchangeConnection, Position, StrategyConfig
-from app.models.enums import ExecutionMode, MarketType, PositionSide, PositionStatus
+from app.api.deps import get_db_session, get_strategy_runner
+from app.domains.cex.execution.runner import ContinuousStrategyRunner
+from app.models.entities import Position, StrategyConfig
+from app.models.enums import MarketType, PositionStatus, TradingEnvironment
 
 router = APIRouter(prefix="/positions", tags=["Positions"])
 
 
+def _resolve_environment(environment: str | None, runner: ContinuousStrategyRunner) -> TradingEnvironment:
+    """The environment a request asks about; defaults to the active one."""
+    if environment is None:
+        return runner.environment
+    try:
+        return TradingEnvironment(environment.upper().strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="environment must be DEMO or LIVE") from exc
+
+
 @router.get("/analytics")
 async def get_positions_analytics(
+    environment: str | None = None,
     db: AsyncSession = Depends(get_db_session),
+    runner: ContinuousStrategyRunner = Depends(get_strategy_runner),
 ) -> dict[str, Any]:
-    """Provide structured post-trade analytics, strategy attribution, and outcome journal."""
+    """Post-trade analytics, strategy attribution and journal for one environment's account."""
+    env = _resolve_environment(environment, runner)
     # 1. Fetch strategies to map IDs to friendly names
     strat_stmt = select(StrategyConfig)
     strats = {s.id: s.name for s in (await db.execute(strat_stmt)).scalars().all()}
 
-    # 2. Fetch all closed positions
-    stmt = select(Position).where(Position.status == "CLOSED").order_by(Position.closed_at.desc())
+    # 2. Fetch the environment's closed positions
+    stmt = (
+        select(Position)
+        .where(Position.status == "CLOSED", Position.execution_mode == env.value)
+        .order_by(Position.closed_at.desc())
+    )
     closed_pos = list((await db.execute(stmt)).scalars().all())
 
     total_trades = len(closed_pos)
@@ -145,65 +161,52 @@ async def get_positions_analytics(
 
 @router.get("")
 async def list_positions(
+    environment: str | None = None,
     db: AsyncSession = Depends(get_db_session),
-    paper_broker: PaperTradingBroker = Depends(get_paper_broker),
+    runner: ContinuousStrategyRunner = Depends(get_strategy_runner),
 ) -> list[dict[str, Any]]:
-    # Fetch strategies to map IDs to friendly names and abbreviations
+    """Recent positions of one environment's Binance account (default: the active one).
+
+    Open positions are marked to the live price from the kline stream.
+    """
+    env = _resolve_environment(environment, runner)
     strat_stmt = select(StrategyConfig)
     strats = {s.id: s.name for s in (await db.execute(strat_stmt)).scalars().all()}
 
     def get_strat_meta(s_id: str | None) -> tuple[str, str]:
-        name = strats.get(s_id, "")
-        if not name:
-            s_str = str(s_id) if s_id else ""
-            if "1e678841" in s_str:
-                name = "Smart DCA Scale-In"
-            elif "0efe0031" in s_str:
-                name = "BTC/ETH EMA RSI Trend"
-            elif "ba77b92f" in s_str:
-                name = "SOL Volatility Breakout"
-            else:
-                name = "Smart DCA Scale-In"
+        name = strats.get(s_id, "") or "Manual / Unknown"
         abbr = "DCA" if "DCA" in name else ("EMA" if "EMA" in name else ("BB" if "Breakout" in name or "BB" in name else "STRAT"))
         return name, abbr
 
-    # Map in-memory paper positions for live mark price & TP lookup
-    paper_map = {pp.position_id: pp for pp in paper_broker.positions}
-
-    # 1. Fetch DB positions (Live & historical)
-    stmt = select(Position).order_by(Position.opened_at.desc()).limit(100)
+    stmt = (
+        select(Position)
+        .where(Position.execution_mode == env.value)
+        .order_by(Position.opened_at.desc())
+        .limit(100)
+    )
     db_positions = (await db.execute(stmt)).scalars().all()
 
     results: list[dict[str, Any]] = []
     for p in db_positions:
         s_name, s_abbr = get_strat_meta(p.strategy_id)
-        pp_live = paper_map.get(p.id)
+        is_open = p.status == PositionStatus.OPEN.value
+        mark = runner.last_price(p.symbol, MarketType(p.market_type)) if is_open else None
+        cur_price = float(mark) if mark is not None else float(p.entry_price)
 
-        # Calculate accurate current/mark price without double-adding entry_price on SHORT
-        if pp_live and getattr(pp_live, "current_price", None):
-            cur_price = float(pp_live.current_price)
-        elif float(p.current_qty) > 0 and float(p.unrealized_pnl_usd) != 0.0:
-            if p.side == "LONG":
-                cur_price = float(p.entry_price) + (float(p.unrealized_pnl_usd) / float(p.current_qty))
-            else:
-                cur_price = float(p.entry_price) - (float(p.unrealized_pnl_usd) / float(p.current_qty))
+        if is_open and mark is not None:
+            direction = Decimal("1") if p.side == "LONG" else Decimal("-1")
+            unrealized = (mark - p.entry_price) * p.current_qty * direction
         else:
-            cur_price = float(p.entry_price)
+            unrealized = p.unrealized_pnl_usd or Decimal("0")
 
-        # Resolve take profit price from stored strategy targets first
         tp_price: float | None = None
-        if p.take_profit_state and isinstance(p.take_profit_state, list) and len(p.take_profit_state) > 0:
+        if p.take_profit_state and isinstance(p.take_profit_state, list) and p.take_profit_state:
             first_tp = p.take_profit_state[0]
             if isinstance(first_tp, dict) and "price" in first_tp:
                 tp_price = float(first_tp["price"])
-        if tp_price is None and pp_live and pp_live.tp_targets:
-            tp_price = float(pp_live.tp_targets[0].price)
-        if tp_price is None:
-            tp_price = float(p.entry_price * Decimal("1.04")) if p.side == "LONG" else float(p.entry_price * Decimal("0.96"))
 
-        unrealized_usd = float(pp_live.unrealized_pnl) if pp_live else float(p.unrealized_pnl_usd)
         notional_usd = float(p.entry_price) * float(p.current_qty)
-
+        unrealized_usd = float(unrealized)
         results.append({
             "id": p.id,
             "strategy_id": p.strategy_id,
@@ -228,48 +231,6 @@ async def list_positions(
             "status": p.status,
             "opened_at": p.opened_at.isoformat(),
         })
-
-    # 2. Append active paper positions (deduplicate against DB records)
-    db_ids = {p.id for p in db_positions}
-    for pp in paper_broker.positions:
-        if pp.position_id in db_ids:
-            continue
-        s_name, s_abbr = get_strat_meta(pp.strategy_id)
-        tp_val = (
-            float(pp.tp_targets[0].price)
-            if pp.tp_targets
-            else (float(pp.entry_price * Decimal("1.04")) if pp.side.value == "LONG" else float(pp.entry_price * Decimal("0.96")))
-        )
-        notional_pp = float(pp.entry_price * pp.current_qty)
-        unrealized_pp = float(getattr(pp, "unrealized_pnl", Decimal("0")))
-        results.insert(
-            0,
-            {
-                "id": pp.position_id,
-                "strategy_id": pp.strategy_id,
-                "strategy_name": s_name,
-                "strategy_abbr": s_abbr,
-                "symbol": pp.symbol,
-                "market_type": pp.market_type.value,
-                "execution_mode": ExecutionMode.PAPER.value,
-                "side": pp.side.value,
-                "margin_mode": "ISOLATED",
-                "leverage": pp.leverage,
-                "entry_price": float(pp.entry_price),
-                "current_price": float(getattr(pp, "current_price", pp.entry_price)),
-                "current_qty": float(pp.current_qty),
-                "stop_loss_price": float(pp.stop_loss_price) if pp.stop_loss_price else None,
-                "take_profit_price": tp_val,
-                "stop_order_live": pp.stop_order_live,
-                "unrealized_pnl_usd": unrealized_pp,
-                "unrealized_pnl_pct": (unrealized_pp / notional_pp * 100 * pp.leverage) if notional_pp > 0 else 0.0,
-                "realized_pnl_usd": float(pp.realized_pnl),
-                "exit_reason": getattr(pp, "exit_reason", None),
-                "status": pp.status.value,
-                "opened_at": pp.created_at.isoformat(),
-            },
-        )
-
     return results
 
 
@@ -277,41 +238,26 @@ async def list_positions(
 async def close_position(
     position_id: str,
     db: AsyncSession = Depends(get_db_session),
-    factory: ExchangeAdapterFactory = Depends(get_adapter_factory),
-    paper_broker: PaperTradingBroker = Depends(get_paper_broker),
+    runner: ContinuousStrategyRunner = Depends(get_strategy_runner),
 ) -> dict[str, str]:
-    # Check paper positions first
-    if await paper_broker.close_position_market(position_id, exit_reason="MANUAL_CLOSE"):
-        return {"status": "CLOSED", "position_id": position_id, "mode": "PAPER"}
-
-    # Check live DB positions
-    stmt = select(Position).where(Position.id == position_id)
-    pos = (await db.execute(stmt)).scalar_one_or_none()
+    """Flatten a position on the Binance account it lives on (cancels its stop first)."""
+    pos = await db.get(Position, position_id)
     if not pos:
         raise HTTPException(status_code=404, detail="Position not found.")
-
     if pos.status != PositionStatus.OPEN.value:
         raise HTTPException(status_code=400, detail="Position is already closed.")
+    if pos.execution_mode not in (TradingEnvironment.DEMO.value, TradingEnvironment.LIVE.value):
+        raise HTTPException(status_code=400, detail="Paper positions from the removed simulator cannot be closed.")
+    if runner.live_broker is None:
+        raise HTTPException(status_code=503, detail="Exchange broker is not configured.")
 
-    conn_stmt = select(ExchangeConnection).where(ExchangeConnection.id == pos.exchange_connection_id)
-    conn = (await db.execute(conn_stmt)).scalar_one_or_none()
-    if not conn:
-        pos.status = PositionStatus.CLOSED.value
-        await db.commit()
-        return {"status": "CLOSED", "position_id": position_id}
-
-    adapter = factory.create_from_connection(conn)
-    try:
-        await adapter.close_position_market(
-            symbol=pos.symbol,
-            market_type=MarketType(pos.market_type),
-            side=PositionSide(pos.side),
-            quantity=pos.current_qty,
-            client_order_id=f"close_{pos.id[:8]}",
+    adapter = await runner._get_live_adapter(pos.exchange_connection_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This position's API key is missing or disabled; close it on Binance directly.",
         )
-        pos.status = PositionStatus.CLOSED.value
-        pos.current_qty = Decimal("0")
-        await db.commit()
-        return {"status": "CLOSED", "position_id": position_id, "mode": "LIVE"}
-    finally:
-        await adapter.close()
+    closed = await runner.live_broker.close_position(adapter, position_id, exit_reason="MANUAL_CLOSE")
+    if not closed:
+        raise HTTPException(status_code=502, detail="Binance did not accept the close order; see risk alerts.")
+    return {"status": "CLOSED", "position_id": position_id, "mode": pos.execution_mode}

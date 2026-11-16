@@ -10,7 +10,6 @@ from app.core.database import build_async_engine, build_session_factory, init_da
 from app.core.events import EventBus, MarketCandleEvent, TradeSignalEvent
 from app.domains.cex.adapters.base import CandleBar
 from app.domains.cex.backtesting import DeterministicBacktestEngine, fetch_ohlcv_history
-from app.domains.cex.execution.paper_broker import PaperTradingBroker
 from app.domains.cex.execution.runner import ContinuousStrategyRunner
 from app.domains.cex.market_data.buffer import CandleBuffer
 from app.domains.cex.risk.gatekeeper import RiskGatekeeper
@@ -348,8 +347,38 @@ async def test_fetch_ohlcv_history_pages_and_drops_unfinished_bar() -> None:
 
 
 # =====================================================================
-# 4. Live runner: target-weight entry and strategy-driven exit (paper)
+# 4. Runner: target-weight entry and strategy-driven exit on the demo account
 # =====================================================================
+
+
+async def _demo_runner(session_factory: Any, bus: EventBus) -> tuple[ContinuousStrategyRunner, Any]:
+    """Runner trading on a mocked Binance Demo Trading account with $10,000 equity."""
+    from app.domains.cex.execution import HybridSlTpManager, LiveExecutionBroker
+    from app.models.entities import ExchangeConnection
+    from tests.unit.test_milestone8_live_execution import LiveMockAdapter, StubAdapterFactory
+
+    adapter = LiveMockAdapter()
+    async with session_factory() as session:
+        session.add(
+            ExchangeConnection(
+                id="demo-conn", exchange_id="BINANCE", label="demo", api_key_masked="x***",
+                api_key_encrypted="x", api_secret_encrypted="y", environment="DEMO",
+                futures_capital_cap_usd=Decimal("0"),  # no cap: size from the whole balance
+            )
+        )
+        await session.commit()
+    sl_tp = HybridSlTpManager(event_bus=bus)
+    runner = ContinuousStrategyRunner(
+        session_factory=session_factory,
+        event_bus=bus,
+        risk_gatekeeper=RiskGatekeeper(event_bus=bus),
+        adapter_factory=StubAdapterFactory(adapter),  # type: ignore[arg-type]
+        live_broker=LiveExecutionBroker(session_factory=session_factory, event_bus=bus, sl_tp_manager=sl_tp),
+        sl_tp_manager=sl_tp,
+        enable_kline_stream=False,
+        market_data_adapter=adapter,
+    )
+    return runner, adapter
 
 
 async def test_runner_sizes_by_target_weight_and_closes_on_exit_signal() -> None:
@@ -357,8 +386,6 @@ async def test_runner_sizes_by_target_weight_and_closes_on_exit_signal() -> None
     await init_database(engine)
     session_factory = build_session_factory(engine)
     bus = EventBus()
-    paper = PaperTradingBroker(event_bus=bus, initial_balance_usd=Decimal("10000"))
-    paper._session_factory = session_factory
 
     cfg = StrategyConfig(
         id="vt-live-01",
@@ -374,13 +401,7 @@ async def test_runner_sizes_by_target_weight_and_closes_on_exit_signal() -> None
         session.add(cfg)
         await session.commit()
 
-    runner = ContinuousStrategyRunner(
-        session_factory=session_factory,
-        event_bus=bus,
-        paper_broker=paper,
-        risk_gatekeeper=RiskGatekeeper(event_bus=bus),
-        adapter_factory=None,  # type: ignore[arg-type]
-    )
+    runner, adapter = await _demo_runner(session_factory, bus)
     strat = StrategyRegistry.create_instance(cfg)
 
     entry = strat.create_signal(
@@ -393,18 +414,18 @@ async def test_runner_sizes_by_target_weight_and_closes_on_exit_signal() -> None
     await runner._process_signal(entry, cfg, Decimal("100"))
 
     # 75% of $10,000 at $100, not capped by the default $5,000 notional limit.
-    assert len(paper.positions) == 1
-    assert abs(paper.positions[0].current_qty - Decimal("75")) < Decimal("0.1")
+    assert len(adapter.placed_orders) == 1
+    assert adapter.placed_orders[0].quantity == Decimal("75")
 
     exit_sig = strat.create_exit_signal("BTC/USDT", PositionSide.LONG, Decimal("120"))
     await runner._process_signal(exit_sig, cfg, Decimal("120"))
-    assert paper.positions == []
-    assert paper.total_equity > Decimal("10000")
+    assert len(adapter.closed) == 1
 
     async with session_factory() as session:
         db_pos = (await session.execute(select(Position))).scalars().one()
         assert db_pos.status == "CLOSED"
         assert db_pos.exit_reason == "STRATEGY_EXIT"
+        assert db_pos.execution_mode == "DEMO"
 
     await engine.dispose()
 
@@ -416,13 +437,12 @@ async def test_runner_sizes_by_target_weight_and_closes_on_exit_signal() -> None
 
 async def test_take_profit_percentages_persist_and_restore() -> None:
     from app.core.events import TakeProfitTargetSpec
+    from app.domains.cex.execution import HybridSlTpManager
 
     engine = build_async_engine("sqlite+aiosqlite:///:memory:")
     await init_database(engine)
     session_factory = build_session_factory(engine)
     bus = EventBus()
-    paper = PaperTradingBroker(event_bus=bus, initial_balance_usd=Decimal("10000"))
-    paper._session_factory = session_factory
 
     cfg = StrategyConfig(
         id="tp-01",
@@ -438,13 +458,7 @@ async def test_take_profit_percentages_persist_and_restore() -> None:
         session.add(cfg)
         await session.commit()
 
-    runner = ContinuousStrategyRunner(
-        session_factory=session_factory,
-        event_bus=bus,
-        paper_broker=paper,
-        risk_gatekeeper=RiskGatekeeper(event_bus=bus),
-        adapter_factory=None,  # type: ignore[arg-type]
-    )
+    runner, _ = await _demo_runner(session_factory, bus)
     strat = StrategyRegistry.create_instance(cfg)
     entry = strat.create_signal(
         symbol="BTC/USDT",
@@ -463,9 +477,11 @@ async def test_take_profit_percentages_persist_and_restore() -> None:
         db_pos = (await session.execute(select(Position))).scalars().one()
         assert [t["close_dynamic_pct"] for t in db_pos.take_profit_state] == ["50", "50"]
 
-    # A fresh broker (server restart) restores the same percentages, not the 100% default.
-    restarted = PaperTradingBroker(event_bus=bus, initial_balance_usd=Decimal("10000"))
-    assert await restarted.load_open_positions_from_db(session_factory) == 1
-    assert [t.close_dynamic_pct for t in restarted.positions[0].tp_targets] == [Decimal("50"), Decimal("50")]
+    # After a restart the protection state is rebuilt with the same percentages.
+    restarted = HybridSlTpManager(event_bus=bus)
+    assert restarted.restore_protection(db_pos) is True
+    state = restarted.get_state(db_pos.id)
+    assert state is not None
+    assert [t.close_dynamic_pct for t in state.tp_targets] == [Decimal("50"), Decimal("50")]
 
     await engine.dispose()

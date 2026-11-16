@@ -17,6 +17,8 @@ from app.api.routes_webhooks import router as webhooks_router
 from app.api.ws import hub, ws_router
 from app.config import get_settings
 from app.core.database import init_database
+from app.models.entities import GlobalRiskState
+from app.models.enums import TradingEnvironment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,9 +39,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 2. Wire event bus to WebSocket broadcast hub
     hub.setup_event_bus_listener(state.event_bus)
 
-    # 3. Hydrate open paper positions from database
-    loaded_count = await state.paper_broker.load_open_positions_from_db(state.session_factory)
-    logger.info("Hydrated %d open paper positions from database into active broker.", loaded_count)
+    # 3. Restore the saved risk state and trading environment (DEMO or LIVE)
+    async with state.session_factory() as session:
+        risk_row = await session.get(GlobalRiskState, 1)
+    if risk_row is not None:
+        state.risk_gatekeeper.update_risk_state(risk_row)
+        state.strategy_runner.environment = TradingEnvironment(risk_row.active_environment)
+    logger.info("Trading environment: %s", state.strategy_runner.environment.value)
 
     # 4. Start continuous background strategy evaluation & live market runner
     state.strategy_runner.start()

@@ -30,14 +30,12 @@ flowchart TD
         SIZER["Fixed Fractional Position Sizer"]
         STRATS["Strategies: EMA/RSI, Bollinger Breakout, Smart DCA"]
         SLTP["Hybrid SL/TP Manager (Airbag + Trailing)"]
-        PAPER["Paper Trading Broker Simulation"]
-        LIVE["Live Exchange Broker with Idempotency"]
+        LIVE["Exchange Broker with Idempotency (Demo or Live account)"]
         VAULT["Hardware-Derived AES-256-GCM Vault"]
     end
 
     subgraph Exchanges ["Exchange Connectors (CCXT / REST / WS)"]
-        BINANCE["Binance Spot & USDT-M Futures"]
-        BYBIT["Bybit V5 Linear Futures"]
+        BINANCE["Binance Spot & USDT-M Futures (Demo Trading or Live)"]
     end
 
     UI_WS <-->|"ws://localhost:8010/ws/stream"| WS_HUB
@@ -48,10 +46,8 @@ flowchart TD
     RISK --> SIZER
     SIZER --> STRATS
     STRATS --> SLTP
-    SLTP --> PAPER
     SLTP --> LIVE
     LIVE <--> BINANCE
-    LIVE <--> BYBIT
 ```
 
 ---
@@ -116,8 +112,18 @@ The Web Dashboard is served on port 80 at `http://localhost` (or `http://<your-v
    - One-Way Mode & Isolated Margin defaults.
    - 1-click Emergency Kill Switch.
 
-## ⚡ Live Execution
-- **Turning it on**: set a strategy's `execution_mode` to `LIVE` and its `exchange_connection_id` to an enabled exchange connection. Every other strategy keeps paper trading.
+## ⚡ Demo and Live Trading
+Every trade is placed on Binance. The app runs in one of two environments at a time, switched with the **Demo | Live** control in the dashboard header:
+
+| Environment | Binance account | API key from | Endpoints |
+|---|---|---|---|
+| **Demo** (default) | Binance Demo Trading, demo funds | demo.binance.com → API Management | `demo-api.binance.com`, `demo-fapi.binance.com` |
+| **Live** | Your real account, real money | binance.com → API Management (enable futures, never withdrawals) | `api.binance.com`, `fapi.binance.com` |
+
+- **Setting up**: add one key per environment under **API Keys** and choose its account (Demo or Live). Active strategies trade on the active environment's newest enabled Binance key.
+- **Switching**: the choice is saved and survives restarts. Switching to Live needs a Live key and a confirmation. Positions open on the other environment are not closed: they keep their exchange stops, stop fills are still detected, and strategy exit signals still close them on their own account.
+- **What you see**: positions, orders, analytics and the header equity (read from the Binance balance) belong to the active environment.
+- **Paper trading is gone**: the old in-app simulator was removed. Its past positions stay in the database (`execution_mode = PAPER`) but are no longer shown.
 - **When strategies run**: on Binance's kline WebSocket, the moment a candle closes. A 15s housekeeping loop also refreshes strategies and polls any symbol whose stream is stale over REST. Set `MARKET_STREAM_ENABLED=false` to use polling only.
 - **Entry flow**: risk gatekeeper → size from `min(balance, connection capital cap)` → futures symbol set to isolated margin with `risk_config.leverage` (default 1x) → market order → exchange-side stop. If the stop cannot be placed, the position is closed at once.
 - **Futures stops**: placed through Binance's Algo Order API (`/fapi/v1/algoOrder`). Binance has rejected `STOP_MARKET` on `/fapi/v1/order` since December 2025.

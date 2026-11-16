@@ -13,7 +13,6 @@ from app.core.events import EventBus
 from app.core.security import CredentialVault
 from app.domains.cex.adapters.factory import ExchangeAdapterFactory
 from app.domains.cex.execution.live_broker import LiveExecutionBroker
-from app.domains.cex.execution.paper_broker import PaperTradingBroker
 from app.domains.cex.execution.runner import ContinuousStrategyRunner
 from app.domains.cex.execution.sl_tp_manager import HybridSlTpManager
 from app.domains.cex.market_data.stream_manager import MarketStreamManager
@@ -35,7 +34,6 @@ class AppState:
 
         self.risk_gatekeeper = RiskGatekeeper(event_bus=self.event_bus)
         self.sl_tp_manager = HybridSlTpManager(event_bus=self.event_bus)
-        self.paper_broker = PaperTradingBroker(event_bus=self.event_bus)
         self.stream_manager = MarketStreamManager(event_bus=self.event_bus)
         self.live_broker = LiveExecutionBroker(
             session_factory=self.session_factory,
@@ -45,7 +43,6 @@ class AppState:
         self.strategy_runner = ContinuousStrategyRunner(
             session_factory=self.session_factory,
             event_bus=self.event_bus,
-            paper_broker=self.paper_broker,
             risk_gatekeeper=self.risk_gatekeeper,
             adapter_factory=self.adapter_factory,
             poll_interval_seconds=settings.strategy_poll_interval_seconds,
@@ -95,10 +92,6 @@ async def get_risk_gatekeeper() -> RiskGatekeeper:
 
 async def get_sl_tp_manager() -> HybridSlTpManager:
     return get_app_state().sl_tp_manager
-
-
-async def get_paper_broker() -> PaperTradingBroker:
-    return get_app_state().paper_broker
 
 
 async def get_stream_manager() -> MarketStreamManager:

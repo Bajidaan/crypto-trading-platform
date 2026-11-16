@@ -84,6 +84,8 @@ class WebSocketHub:
                 payload["data"] = {
                     "id": event.position_id,
                     "position_id": event.position_id,
+                    # DEMO or LIVE: the dashboard only shows the active environment's positions.
+                    "execution_mode": event.execution_mode.value,
                     "symbol": event.symbol,
                     "side": event.side.value,
                     "status": event.status.value,

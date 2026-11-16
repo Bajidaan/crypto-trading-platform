@@ -19,10 +19,10 @@ from app.core.database import (
 )
 from app.core.events import EventBus, TradeSignalEvent
 from app.domains.cex.adapters.base import CandleBar
-from app.domains.cex.execution import HybridSlTpManager, LiveExecutionBroker, PaperTradingBroker
+from app.domains.cex.execution import HybridSlTpManager, LiveExecutionBroker
 from app.domains.cex.execution.runner import ContinuousStrategyRunner
 from app.domains.cex.risk import RiskGatekeeper
-from app.models.entities import Fill, Order, Position, StrategyConfig
+from app.models.entities import ExchangeConnection, Fill, Order, Position, StrategyConfig
 from app.models.enums import MarketType, PositionSide, SignalSource
 from tests.unit.test_milestone8_live_execution import LiveMockAdapter, StubAdapterFactory
 
@@ -85,13 +85,14 @@ async def test_same_trade_id_allowed_on_different_orders() -> None:
 async def _runner(sf: Any, adapter: LiveMockAdapter | None = None) -> ContinuousStrategyRunner:
     bus = EventBus()
     sl_tp = HybridSlTpManager(event_bus=bus)
-    paper = PaperTradingBroker(event_bus=bus)
-    await paper.load_open_positions_from_db(sf)
     adapter = adapter or LiveMockAdapter()
+    async with sf() as s:
+        s.add(ExchangeConnection(id="demo", exchange_id="BINANCE", label="demo", api_key_masked="d***",
+                                 api_key_encrypted="x", api_secret_encrypted="y", environment="DEMO"))
+        await s.commit()
     return ContinuousStrategyRunner(
         session_factory=sf,
         event_bus=bus,
-        paper_broker=paper,
         risk_gatekeeper=RiskGatekeeper(event_bus=bus),
         adapter_factory=StubAdapterFactory(adapter),  # type: ignore[arg-type]
         live_broker=LiveExecutionBroker(session_factory=sf, event_bus=bus, sl_tp_manager=sl_tp),
@@ -101,10 +102,11 @@ async def _runner(sf: Any, adapter: LiveMockAdapter | None = None) -> Continuous
     )
 
 
-async def test_paper_orders_in_same_second_are_all_saved() -> None:
+async def test_orders_in_same_second_are_all_saved() -> None:
+    """Two symbols of one strategy filling in the same second both keep their order records."""
     engine, sf = await _db()
     async with sf() as s:
-        cfg = StrategyConfig(id="s1", name="multi", strategy_class="x", execution_mode="PAPER",
+        cfg = StrategyConfig(id="s1", name="multi", strategy_class="x",
                              market_type="FUTURES_USDT", symbols=["BTC/USDT", "ETH/USDT"], is_active=True)
         s.add(cfg)
         await s.commit()
@@ -116,35 +118,8 @@ async def test_paper_orders_in_same_second_are_all_saved() -> None:
         await runner._process_signal(sig, cfg, price)
     async with sf() as s:
         orders = (await s.execute(select(Order))).scalars().all()
-    assert sorted(o.symbol for o in orders) == ["BTC/USDT", "ETH/USDT"]
-    await engine.dispose()
-
-
-async def test_price_ticks_do_not_write_until_flush() -> None:
-    engine, sf = await _db()
-    async with sf() as s:
-        cfg = StrategyConfig(id="s1", name="one", strategy_class="x", execution_mode="PAPER",
-                             market_type="FUTURES_USDT", symbols=["BTC/USDT"], is_active=True)
-        s.add(cfg)
-        await s.commit()
-        await s.refresh(cfg)
-    runner = await _runner(sf)
-    sig = TradeSignalEvent(strategy_id="s1", source=SignalSource.STRATEGY, symbol="BTC/USDT",
-                           side=PositionSide.LONG, target_weight=Decimal("0.1"), stop_loss_price=Decimal("60000"))
-    await runner._process_signal(sig, cfg, Decimal("65000"))
-    paper = runner.paper_broker
-
-    for px in ("65100", "65200", "65300"):
-        await paper.on_price_update("BTC/USDT", Decimal(px), Decimal(px), Decimal(px))
-    async with sf() as s:
-        pos = (await s.execute(select(Position))).scalar_one()
-    assert pos.unrealized_pnl_usd == Decimal("0")  # nothing written per tick
-
-    assert await paper.flush_marks_to_db() == 1
-    assert await paper.flush_marks_to_db() == 0  # nothing new since
-    async with sf() as s:
-        pos = (await s.execute(select(Position))).scalar_one()
-    assert pos.unrealized_pnl_usd == paper.positions[0].unrealized_pnl > Decimal("0")
+    entries = sorted(o.symbol for o in orders if o.purpose == "ENTRY")
+    assert entries == ["BTC/USDT", "ETH/USDT"]
     await engine.dispose()
 
 
@@ -193,7 +168,7 @@ async def test_legacy_database_is_stamped_and_migrated(tmp_path: Path) -> None:
         version = (await s.execute(text("select version_num from alembic_version"))).scalar_one()
     await engine.dispose()
 
-    assert version == "0002"
+    assert version == "0004"
     assert pos.entry_price == Decimal("65000.5") and pos.realized_pnl_usd == Decimal("-1.25")
     assert len(orders) == 1  # rebuilding positions must not cascade-delete its orders
 

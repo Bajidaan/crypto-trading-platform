@@ -76,7 +76,6 @@ export const StrategyPanel: React.FC<StrategyPanelProps> = ({
 }) => {
   const [editingStrategy, setEditingStrategy] = useState<StrategyItem | null>(null);
   const [editTimeframe, setEditTimeframe] = useState<string>('15m');
-  const [editMode, setEditMode] = useState<'PAPER' | 'LIVE'>('PAPER');
   const [editMarketType, setEditMarketType] = useState<string>('FUTURES_USDT');
   const [editParams, setEditParams] = useState<Record<string, any>>({});
   const [isSaving, setIsSaving] = useState<boolean>(false);
@@ -84,7 +83,6 @@ export const StrategyPanel: React.FC<StrategyPanelProps> = ({
   const openEditor = (s: StrategyItem) => {
     setEditingStrategy(s);
     setEditTimeframe(s.timeframe || '15m');
-    setEditMode(s.execution_mode || 'PAPER');
     setEditMarketType(s.market_type || 'FUTURES_USDT');
     const defaults = STRATEGY_DEFAULTS[s.strategy_class] || {};
     setEditParams({ ...defaults, ...(s.parameters || {}) });
@@ -98,7 +96,6 @@ export const StrategyPanel: React.FC<StrategyPanelProps> = ({
     try {
       await onUpdateStrategy(editingStrategy.id, {
         timeframe: editTimeframe,
-        execution_mode: editMode,
         market_type: editMarketType,
         parameters: editParams,
       });
@@ -196,16 +193,6 @@ export const StrategyPanel: React.FC<StrategyPanelProps> = ({
             <div className="mt-3 flex items-center justify-between pt-1">
               <div className="flex items-center space-x-1.5">
                 <span
-                  className={`text-[10px] font-semibold uppercase px-2 py-0.5 rounded ${
-                    s.execution_mode === 'LIVE'
-                      ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                      : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
-                  }`}
-                >
-                  {s.execution_mode}
-                </span>
-
-                <span
                   className={`text-[10px] font-mono font-semibold uppercase px-2 py-0.5 rounded border ${
                     s.market_type === 'SPOT'
                       ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
@@ -247,7 +234,7 @@ export const StrategyPanel: React.FC<StrategyPanelProps> = ({
 
             <form onSubmit={handleSave} className="space-y-4 text-xs">
               {/* Market Type, Timeframe & Mode */}
-              <div className="grid grid-cols-3 gap-2.5">
+              <div className="grid grid-cols-2 gap-2.5">
                 <div>
                   <label className="block text-gray-400 mb-1 font-semibold">Market Type</label>
                   <select
@@ -272,18 +259,6 @@ export const StrategyPanel: React.FC<StrategyPanelProps> = ({
                         {tf}
                       </option>
                     ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-gray-400 mb-1 font-semibold">Execution</label>
-                  <select
-                    value={editMode}
-                    onChange={(e) => setEditMode(e.target.value as any)}
-                    className="w-full bg-darkcard border border-darkborder rounded-lg px-2.5 py-2 text-white font-mono focus:border-blue-500 outline-none text-[11px]"
-                  >
-                    <option value="PAPER">PAPER (Sim)</option>
-                    <option value="LIVE">LIVE (Real)</option>
                   </select>
                 </div>
               </div>

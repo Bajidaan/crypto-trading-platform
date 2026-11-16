@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Key, Plus, Shield, Trash2, X } from 'lucide-react';
-import type { ConnectionItem } from '../types';
+import type { ConnectionItem, TradingEnvironment } from '../types';
 
 interface ConnectionsModalProps {
   isOpen: boolean;
@@ -11,7 +11,7 @@ interface ConnectionsModalProps {
     label: string;
     api_key: string;
     api_secret: string;
-    is_testnet: boolean;
+    environment: TradingEnvironment;
     spot_capital_cap_usd?: number;
     futures_capital_cap_usd?: number;
   }) => Promise<void>;
@@ -29,10 +29,11 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
   const [label, setLabel] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
-  const [isTestnet, setIsTestnet] = useState(true);
+  const [environment, setEnvironment] = useState<TradingEnvironment>('DEMO');
   const [futuresCap, setFuturesCap] = useState('2000');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -51,7 +52,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
         label,
         api_key: apiKey,
         api_secret: apiSecret,
-        is_testnet: isTestnet,
+        environment,
         futures_capital_cap_usd: Number(futuresCap) || 2000,
       });
       setLabel('');
@@ -95,10 +96,15 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
           <h3 className="text-xs font-bold uppercase text-gray-400 tracking-wider mb-2">
             Configured Exchanges ({connections.length})
           </h3>
+          {deleteError && (
+            <div className="mb-2 p-2.5 rounded bg-rose-500/20 border border-rose-500/30 text-rose-300 text-xs">
+              {deleteError}
+            </div>
+          )}
           {connections.length === 0 ? (
             <div className="p-4 bg-darkcard rounded-lg text-center text-xs text-gray-500">
-              No API keys configured. Add your Binance or Bybit credentials below to enable live
-              exchange order execution.
+              No API keys yet. Add a Binance Demo Trading key to test strategies with demo funds, and
+              a Live key for your real account.
             </div>
           ) : (
             <div className="space-y-2">
@@ -113,9 +119,13 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                       <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-darkpanel text-blue-400 border border-darkborder">
                         {c.exchange_id}
                       </span>
-                      {c.is_testnet && (
+                      {(c.environment ?? (c.is_testnet ? 'DEMO' : 'LIVE')) === 'DEMO' ? (
                         <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                          TESTNET
+                          DEMO
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                          LIVE
                         </span>
                       )}
                     </div>
@@ -125,7 +135,14 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                   </div>
 
                   <button
-                    onClick={() => onDeleteConnection(c.id)}
+                    onClick={async () => {
+                      setDeleteError(null);
+                      try {
+                        await onDeleteConnection(c.id);
+                      } catch (err: any) {
+                        setDeleteError(err.message || 'Could not remove this API key.');
+                      }
+                    }}
                     className="p-1.5 rounded hover:bg-rose-500/20 text-gray-400 hover:text-rose-400 transition"
                     title="Remove Credential"
                   >
@@ -158,7 +175,6 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                 className="w-full bg-darkcard border border-darkborder rounded-lg px-3 py-2 text-white font-mono focus:border-blue-500 outline-none"
               >
                 <option value="BINANCE">Binance (Spot + Futures)</option>
-                <option value="BYBIT">Bybit (V5 Unified / Linear)</option>
               </select>
             </div>
 
@@ -206,16 +222,21 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
               />
             </div>
 
-            <div className="flex items-center pt-5">
-              <label className="flex items-center space-x-2 cursor-pointer text-gray-300">
-                <input
-                  type="checkbox"
-                  checked={isTestnet}
-                  onChange={(e) => setIsTestnet(e.target.checked)}
-                  className="rounded bg-darkcard border-darkborder text-blue-600 focus:ring-0"
-                />
-                <span className="font-semibold">Testnet / Sandbox Mode</span>
-              </label>
+            <div>
+              <label className="block text-gray-400 mb-1">Account</label>
+              <select
+                value={environment}
+                onChange={(e) => setEnvironment(e.target.value as TradingEnvironment)}
+                className="w-full bg-darkcard border border-darkborder rounded-lg px-3 py-2 text-white font-mono focus:border-blue-500 outline-none"
+              >
+                <option value="DEMO">Demo Trading (demo funds)</option>
+                <option value="LIVE">Live (real money)</option>
+              </select>
+              <p className="mt-1 text-[11px] text-gray-500">
+                {environment === 'DEMO'
+                  ? 'Create this key on demo.binance.com under API Management.'
+                  : 'A key from your real Binance account. Enable futures trading; never enable withdrawals.'}
+              </p>
             </div>
           </div>
 

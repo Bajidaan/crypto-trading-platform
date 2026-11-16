@@ -33,7 +33,7 @@ from app.domains.cex.adapters.base import (
     TickerSnapshot,
 )
 from app.domains.cex.adapters.binance import BinanceAdapter
-from app.domains.cex.execution import HybridSlTpManager, LiveExecutionBroker, PaperTradingBroker
+from app.domains.cex.execution import HybridSlTpManager, LiveExecutionBroker
 from app.domains.cex.execution.runner import ContinuousStrategyRunner
 from app.domains.cex.market_data.binance_ws import BinanceKlineStream, build_stream_url
 from app.domains.cex.market_data.buffer import CandleBuffer
@@ -53,6 +53,7 @@ from app.models.enums import (
     PositionStatus,
     SignalAction,
     SignalSource,
+    TradingEnvironment,
 )
 
 FILL_PRICE = Decimal("65000")
@@ -211,13 +212,16 @@ class LiveMockAdapter(IExchangeAdapter):
 
 
 class StubAdapterFactory:
-    def __init__(self, adapter: IExchangeAdapter) -> None:
+    """Returns `adapter` for every API key, or a per-connection adapter from `by_connection`."""
+
+    def __init__(self, adapter: IExchangeAdapter, by_connection: dict[str, IExchangeAdapter] | None = None) -> None:
         self.adapter = adapter
+        self.by_connection = by_connection or {}
         self.created = 0
 
     def create_from_connection(self, connection: ExchangeConnection, **_: Any) -> IExchangeAdapter:
         self.created += 1
-        return self.adapter
+        return self.by_connection.get(connection.id, self.adapter)
 
 
 class CountingStrategy(IStrategy):
@@ -243,7 +247,7 @@ class CountingStrategy(IStrategy):
         return list(self.to_emit)
 
 
-async def _setup(execution_mode: ExecutionMode = ExecutionMode.LIVE) -> dict[str, Any]:
+async def _setup(environment: TradingEnvironment = TradingEnvironment.DEMO) -> dict[str, Any]:
     engine = build_async_engine("sqlite+aiosqlite:///:memory:")
     await init_database(engine)
     session_factory = build_session_factory(engine)
@@ -251,11 +255,10 @@ async def _setup(execution_mode: ExecutionMode = ExecutionMode.LIVE) -> dict[str
     adapter = LiveMockAdapter()
     sl_tp = HybridSlTpManager(event_bus=bus)
     live_broker = LiveExecutionBroker(session_factory=session_factory, event_bus=bus, sl_tp_manager=sl_tp)
-    paper = PaperTradingBroker(event_bus=bus)
     runner = ContinuousStrategyRunner(
         session_factory=session_factory,
         event_bus=bus,
-        paper_broker=paper,
+        environment=environment,
         risk_gatekeeper=RiskGatekeeper(event_bus=bus),
         adapter_factory=StubAdapterFactory(adapter),  # type: ignore[arg-type]
         live_broker=live_broker,
@@ -271,14 +274,13 @@ async def _setup(execution_mode: ExecutionMode = ExecutionMode.LIVE) -> dict[str
             api_key_masked="abc***",
             api_key_encrypted="x",
             api_secret_encrypted="y",
-            is_testnet=True,
+            environment=environment.value,
             futures_capital_cap_usd=Decimal("5000"),
         )
         cfg = StrategyConfig(
             id="strat-live-1",
             name="Live Trend",
             strategy_class="ema_rsi_atr",
-            execution_mode=execution_mode.value,
             exchange_connection_id="conn-1",
             market_type=MarketType.FUTURES_USDT.value,
             symbols=["BTC/USDT"],
@@ -302,7 +304,7 @@ async def _setup(execution_mode: ExecutionMode = ExecutionMode.LIVE) -> dict[str
         "adapter": adapter,
         "runner": runner,
         "cfg": cfg,
-        "paper": paper,
+        "bus": bus,
         "sl_tp": sl_tp,
         "alerts": alerts,
     }
@@ -356,11 +358,8 @@ async def test_live_strategy_places_real_order_with_exchange_stop() -> None:
     assert len(adapter.placed_stops) == 1
     assert adapter.placed_stops[0]["stop_price"] == Decimal("63000")
 
-    # Nothing went to the paper broker.
-    assert env["paper"].positions == []
-
     [pos] = await _positions(env["session_factory"])
-    assert pos.execution_mode == ExecutionMode.LIVE.value
+    assert pos.execution_mode == ExecutionMode.DEMO.value
     assert pos.status == PositionStatus.OPEN.value
     assert pos.stop_order_live is True
     assert pos.active_stop_order_id == adapter.placed_stops[0]["cid"]
@@ -447,13 +446,13 @@ async def test_failed_stop_placement_flattens_the_position() -> None:
     assert pos.exit_reason == "STOP_PLACEMENT_FAILED"
 
 
-async def test_live_signal_without_connection_is_dropped_with_alert() -> None:
-    env = await _setup()
-    cfg: StrategyConfig = env["cfg"]
-    cfg.exchange_connection_id = None
-    await env["runner"]._process_signal(_entry_signal(), cfg, FILL_PRICE)
+async def test_signal_without_environment_key_is_dropped_with_alert() -> None:
+    env = await _setup()  # only a DEMO key exists
+    runner: ContinuousStrategyRunner = env["runner"]
+    runner.environment = TradingEnvironment.LIVE
+    await runner._process_signal(_entry_signal(), env["cfg"], FILL_PRICE)
     assert env["adapter"].placed_orders == []
-    assert any(a.rule_name == "LIVE_CONNECTION_MISSING" for a in env["alerts"])
+    assert any(a.rule_name == "ENVIRONMENT_CONNECTION_MISSING" for a in env["alerts"])
 
 
 async def test_breakeven_move_is_persisted_for_stop_sync() -> None:
@@ -490,11 +489,64 @@ async def test_restart_restores_tier2_protection() -> None:
     assert state.breakeven_triggered is False
 
 
-async def test_paper_strategies_still_use_paper_broker() -> None:
-    env = await _setup(ExecutionMode.PAPER)
-    await env["runner"]._process_signal(_entry_signal(), env["cfg"], FILL_PRICE)
-    assert env["adapter"].placed_orders == []
-    assert len(env["paper"].positions) == 1
+async def _add_live_key(env: dict[str, Any]) -> LiveMockAdapter:
+    """Add a LIVE Binance key whose adapter is separate from the DEMO one."""
+    live_adapter = LiveMockAdapter()
+    env["runner"].adapter_factory = StubAdapterFactory(env["adapter"], {"conn-live": live_adapter})
+    async with env["session_factory"]() as session:
+        session.add(ExchangeConnection(
+            id="conn-live", exchange_id="BINANCE", label="real", api_key_masked="r***",
+            api_key_encrypted="x", api_secret_encrypted="y", environment="LIVE",
+            futures_capital_cap_usd=Decimal("5000"),
+        ))
+        await session.commit()
+    return live_adapter
+
+
+async def test_switching_environment_routes_new_entries_and_keeps_old_positions() -> None:
+    env = await _setup()
+    runner: ContinuousStrategyRunner = env["runner"]
+    demo_adapter: LiveMockAdapter = env["adapter"]
+    live_adapter = await _add_live_key(env)
+
+    # Entry while on DEMO goes to the demo account.
+    await runner._process_signal(_entry_signal(), env["cfg"], FILL_PRICE)
+    assert len(demo_adapter.placed_orders) == 1 and live_adapter.placed_orders == []
+
+    await runner.set_environment(TradingEnvironment.LIVE)
+    eth = _entry_signal().model_copy(update={"symbol": "ETH/USDT", "stop_loss_price": Decimal("2900")})
+    await runner._process_signal(eth, env["cfg"], Decimal("3000"))
+    assert len(live_adapter.placed_orders) == 1 and len(demo_adapter.placed_orders) == 1
+
+    positions = {p.symbol: p for p in await _positions(env["session_factory"])}
+    assert positions["BTC/USDT"].execution_mode == "DEMO"
+    assert positions["ETH/USDT"].execution_mode == "LIVE"
+    assert runner.account["environment"] == "LIVE"
+
+    # The DEMO position stays managed: its exchange stop filling still closes it.
+    stop_cid = demo_adapter.placed_stops[0]["cid"]
+    demo_adapter.stop_status[stop_cid] = demo_adapter.stop_status[stop_cid].model_copy(
+        update={"status": OrderStatus.FILLED, "avg_fill_price": Decimal("62990")}
+    )
+    await runner._sync_live_positions()
+    positions = {p.symbol: p for p in await _positions(env["session_factory"])}
+    assert positions["BTC/USDT"].status == PositionStatus.CLOSED.value
+    assert positions["ETH/USDT"].status == PositionStatus.OPEN.value
+
+
+async def test_exit_signal_closes_position_on_its_own_environment() -> None:
+    env = await _setup()
+    runner: ContinuousStrategyRunner = env["runner"]
+    demo_adapter: LiveMockAdapter = env["adapter"]
+    live_adapter = await _add_live_key(env)
+
+    await runner._process_signal(_entry_signal(), env["cfg"], FILL_PRICE)  # opened on DEMO
+    await runner.set_environment(TradingEnvironment.LIVE)
+    await runner._process_signal(_entry_signal(SignalAction.EXIT), env["cfg"], Decimal("66000"))
+
+    assert len(demo_adapter.closed) == 1 and live_adapter.closed == []
+    [pos] = await _positions(env["session_factory"])
+    assert pos.status == PositionStatus.CLOSED.value and pos.execution_mode == "DEMO"
 
 
 # =====================================================================
@@ -524,7 +576,7 @@ async def _drain(runner: ContinuousStrategyRunner) -> None:
 
 
 async def test_closed_kline_triggers_one_evaluation() -> None:
-    env = await _setup(ExecutionMode.PAPER)
+    env = await _setup()
     runner: ContinuousStrategyRunner = env["runner"]
     strat = CountingStrategy("strat-live-1", ["BTC/USDT"])
     runner._active_strategy_instances[env["cfg"].id] = strat

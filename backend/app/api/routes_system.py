@@ -8,12 +8,17 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db_session, get_event_bus, get_paper_broker, get_risk_gatekeeper, get_stream_manager
+from app.api.deps import (
+    get_db_session,
+    get_event_bus,
+    get_risk_gatekeeper,
+    get_strategy_runner,
+)
 from app.core.events import EventBus, RiskAlertEvent
-from app.domains.cex.execution.paper_broker import PaperTradingBroker
-from app.domains.cex.market_data.stream_manager import MarketStreamManager
+from app.domains.cex.execution.runner import ContinuousStrategyRunner
 from app.domains.cex.risk.gatekeeper import RiskGatekeeper
-from app.models.entities import AuditLog, GlobalRiskState
+from app.models.entities import AuditLog, GlobalRiskState, Position
+from app.models.enums import PositionStatus, TradingEnvironment
 
 router = APIRouter(prefix="/system", tags=["System"])
 
@@ -24,18 +29,43 @@ class SystemStatusResponse(BaseModel):
     max_concurrent_positions: int
     max_daily_drawdown_pct: float
     max_leverage_cap: int
-    open_paper_positions: int
-    total_paper_equity: float
+    # DEMO (Binance Demo Trading) or LIVE (the real account): where new trades go.
+    environment: str
+    # Label of the environment's enabled Binance API key; None when none is set up.
+    connection_label: str | None
+    # USDT-M futures wallet equity of the environment's account (spot USDT as fallback).
+    equity_usd: float | None
+    balances: dict[str, Any]
+    balance_error: str | None
+    balance_updated_at: str | None
+    open_positions: int
+    # Open positions left on the other environment (still protected and synced).
+    other_environment_open_positions: int
     active_stream_subscriptions: int
     event_bus_published_count: int
+
+
+class SwitchEnvironmentRequest(BaseModel):
+    environment: TradingEnvironment
+    # Must be true to switch to LIVE, so a stray request can never move real money.
+    confirm_live: bool = False
+
+
+async def _open_count(db: AsyncSession, environment: TradingEnvironment, other: bool = False) -> int:
+    mode_filter = (
+        Position.execution_mode.in_([e.value for e in TradingEnvironment if e != environment])
+        if other
+        else Position.execution_mode == environment.value
+    )
+    stmt = select(func.count(Position.id)).where(Position.status == PositionStatus.OPEN.value, mode_filter)
+    return int((await db.execute(stmt)).scalar() or 0)
 
 
 @router.get("/status", response_model=SystemStatusResponse)
 async def get_system_status(
     db: AsyncSession = Depends(get_db_session),
     gatekeeper: RiskGatekeeper = Depends(get_risk_gatekeeper),
-    paper_broker: PaperTradingBroker = Depends(get_paper_broker),
-    stream_manager: MarketStreamManager = Depends(get_stream_manager),
+    runner: ContinuousStrategyRunner = Depends(get_strategy_runner),
     event_bus: EventBus = Depends(get_event_bus),
 ) -> SystemStatusResponse:
     risk_state = (
@@ -45,11 +75,19 @@ async def get_system_status(
     if risk_state:
         gatekeeper.update_risk_state(risk_state)
     state = gatekeeper.risk_state
+    env = runner.environment
 
-    from app.models.entities import Position
-    stmt_open = select(func.count(Position.id)).where(Position.status == "OPEN")
-    db_open_count = (await db.execute(stmt_open)).scalar() or 0
-    actual_open_count = max(db_open_count, paper_broker.open_positions_count)
+    account = runner.account
+    if account.get("environment") != env.value:
+        account = {}
+    balances = account.get("balances") or {}
+    equity = None
+    for mt in ("FUTURES_USDT", "SPOT"):
+        if mt in balances:
+            equity = float(balances[mt]["total_equity"])
+            break
+    conn = await runner.connection_for_environment(env)
+    stream = runner.stream_stats or {}
 
     return SystemStatusResponse(
         is_paused=state.is_paused,
@@ -57,11 +95,62 @@ async def get_system_status(
         max_concurrent_positions=state.max_concurrent_positions,
         max_daily_drawdown_pct=float(state.max_daily_drawdown_pct),
         max_leverage_cap=state.max_leverage_cap,
-        open_paper_positions=actual_open_count,
-        total_paper_equity=float(paper_broker.total_equity),
-        active_stream_subscriptions=len(stream_manager.subscriptions),
+        environment=env.value,
+        connection_label=conn.label if conn else None,
+        equity_usd=equity,
+        balances={
+            mt: {k: float(v) for k, v in b.items()} for mt, b in balances.items()
+        },
+        balance_error=account.get("error"),
+        balance_updated_at=account.get("updated_at"),
+        open_positions=await _open_count(db, env),
+        other_environment_open_positions=await _open_count(db, env, other=True),
+        active_stream_subscriptions=sum((stream.get("streams") or {}).values()),
         event_bus_published_count=event_bus.stats["published_count"],
     )
+
+
+@router.post("/environment")
+async def switch_environment(
+    req: SwitchEnvironmentRequest,
+    db: AsyncSession = Depends(get_db_session),
+    runner: ContinuousStrategyRunner = Depends(get_strategy_runner),
+    event_bus: EventBus = Depends(get_event_bus),
+) -> dict[str, Any]:
+    """Point new trades at Binance Demo Trading or the real account.
+
+    Open positions on the previous environment are not closed; they stay protected by their
+    exchange stops and keep being synced, and strategy exit signals still close them.
+    """
+    target = req.environment
+    if target == TradingEnvironment.LIVE and not req.confirm_live:
+        raise HTTPException(status_code=400, detail="Switching to LIVE trades real money; confirm_live must be true.")
+    conn = await runner.connection_for_environment(target)
+    if conn is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No enabled {target.value} Binance API key. Add one under API Keys before switching.",
+        )
+
+    risk_state = (await db.execute(select(GlobalRiskState).where(GlobalRiskState.id == 1))).scalar_one()
+    previous = risk_state.active_environment
+    risk_state.active_environment = target.value
+    await db.commit()
+    await runner.set_environment(target)
+
+    if previous != target.value:
+        left_open = await _open_count(db, target, other=True)
+        await event_bus.publish(
+            RiskAlertEvent(
+                severity="CRITICAL" if target == TradingEnvironment.LIVE else "WARNING",
+                rule_name="ENVIRONMENT_SWITCHED",
+                message=(
+                    f"Trading environment switched {previous} -> {target.value} (API key: {conn.label}). "
+                    + (f"{left_open} position(s) remain open on {previous} and stay protected." if left_open else "")
+                ).strip(),
+            )
+        )
+    return {"environment": target.value, "previous": previous, "connection_label": conn.label}
 
 
 @router.post("/pause")

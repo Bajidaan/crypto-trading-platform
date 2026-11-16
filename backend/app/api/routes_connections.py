@@ -11,8 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_adapter_factory, get_db_session, get_vault
 from app.core.security import CredentialVault, mask_api_key
 from app.domains.cex.adapters.factory import ExchangeAdapterFactory
-from app.models.entities import ExchangeConnection
-from app.models.enums import ExchangeId, MarketType
+from app.models.entities import ExchangeConnection, Position
+from app.models.enums import ExchangeId, MarketType, PositionStatus, TradingEnvironment
 
 router = APIRouter(prefix="/connections", tags=["Exchange Connections"])
 
@@ -22,6 +22,9 @@ class CreateConnectionRequest(BaseModel):
     label: str
     api_key: str
     api_secret: str
+    # DEMO: Binance Demo Trading keys (made on demo.binance.com). LIVE: real account keys.
+    environment: TradingEnvironment | None = None
+    # Older clients: is_testnet=True means DEMO. Ignored when `environment` is given.
     is_testnet: bool = True
     spot_capital_cap_usd: float | None = None
     futures_capital_cap_usd: float | None = None
@@ -32,6 +35,7 @@ class ConnectionResponse(BaseModel):
     exchange_id: str
     label: str
     api_key_masked: str
+    environment: str
     is_testnet: bool
     is_active: bool
     spot_capital_cap_usd: float | None
@@ -51,6 +55,7 @@ async def list_connections(
             exchange_id=c.exchange_id,
             label=c.label,
             api_key_masked=c.api_key_masked,
+            environment=c.environment,
             is_testnet=c.is_testnet,
             is_active=c.is_enabled,
             spot_capital_cap_usd=float(c.spot_capital_cap_usd) if c.spot_capital_cap_usd else None,
@@ -83,7 +88,7 @@ async def create_connection(
         api_key_masked=masked_key,
         api_key_encrypted=encrypted_key,
         api_secret_encrypted=encrypted_secret,
-        is_testnet=req.is_testnet,
+        environment=(req.environment or (TradingEnvironment.DEMO if req.is_testnet else TradingEnvironment.LIVE)).value,
         is_enabled=True,
         spot_capital_cap_usd=Decimal(str(req.spot_capital_cap_usd)) if req.spot_capital_cap_usd is not None else Decimal("1000.0"),
         futures_capital_cap_usd=Decimal(str(req.futures_capital_cap_usd)) if req.futures_capital_cap_usd is not None else Decimal("1000.0"),
@@ -97,6 +102,7 @@ async def create_connection(
         exchange_id=conn.exchange_id,
         label=conn.label,
         api_key_masked=conn.api_key_masked,
+        environment=conn.environment,
         is_testnet=conn.is_testnet,
         is_active=conn.is_enabled,
         spot_capital_cap_usd=float(conn.spot_capital_cap_usd) if conn.spot_capital_cap_usd else None,
@@ -114,6 +120,21 @@ async def delete_connection(
     conn = (await db.execute(stmt)).scalar_one_or_none()
     if not conn:
         raise HTTPException(status_code=404, detail="Exchange connection not found.")
+
+    # Positions need their key to be closed and to have their stops checked.
+    open_count = (
+        await db.execute(
+            select(Position.id).where(
+                Position.exchange_connection_id == connection_id,
+                Position.status == PositionStatus.OPEN.value,
+            )
+        )
+    ).scalars().all()
+    if open_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{len(open_count)} open position(s) use this API key. Close them before removing it.",
+        )
 
     await db.delete(conn)
     await db.commit()

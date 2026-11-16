@@ -58,8 +58,13 @@ class LiveExecutionBroker:
         signal: TradeSignalEvent,
         quantity: Decimal,
         exchange_connection_id: str,
+        environment: ExecutionMode = ExecutionMode.LIVE,
     ) -> NormalizedOrderResponse | None:
-        """Place live entry order, record to DB, and initialize exchange-side hard stop-loss."""
+        """Place an entry order on the exchange, record it, and place the exchange-side stop.
+
+        `environment` (DEMO or LIVE) only labels the position; which Binance account the
+        order reaches is decided by the adapter's keys and base URL.
+        """
         order_side = OrderSide.BUY if signal.side == PositionSide.LONG else OrderSide.SELL
         cid = generate_client_order_id(
             purpose="ENTRY",
@@ -122,7 +127,7 @@ class LiveExecutionBroker:
                 id=pos_id,
                 strategy_id=signal.strategy_id,
                 exchange_connection_id=exchange_connection_id,
-                execution_mode=ExecutionMode.LIVE.value,
+                execution_mode=environment.value,
                 symbol=signal.symbol,
                 market_type=signal.market_type.value,
                 side=signal.side.value,
@@ -227,7 +232,7 @@ class LiveExecutionBroker:
                 strategy_id=signal.strategy_id,
                 symbol=signal.symbol,
                 market_type=signal.market_type,
-                execution_mode=ExecutionMode.LIVE,
+                execution_mode=environment,
                 side=signal.side,
                 status=PositionStatus.OPEN,
                 current_qty=held_qty,
@@ -336,7 +341,6 @@ class LiveExecutionBroker:
         async with self.session_factory() as session:
             stmt = select(Position).where(
                 Position.status == PositionStatus.OPEN.value,
-                Position.execution_mode == ExecutionMode.LIVE.value,
                 Position.exchange_connection_id == exchange_connection_id,
                 Position.active_stop_order_id.is_not(None),
             )
@@ -434,7 +438,7 @@ class LiveExecutionBroker:
                 strategy_id=pos.strategy_id,
                 symbol=pos.symbol,
                 market_type=MarketType(pos.market_type),
-                execution_mode=ExecutionMode.LIVE,
+                execution_mode=ExecutionMode(pos.execution_mode),
                 side=PositionSide(pos.side),
                 status=PositionStatus.CLOSED,
                 current_qty=Decimal("0"),

@@ -6,8 +6,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import get_db_session
+from app.api.deps import get_db_session, get_strategy_runner
+from app.domains.cex.execution.runner import ContinuousStrategyRunner
 from app.models.entities import Order, Position, StrategyConfig
+from app.models.enums import TradingEnvironment
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -15,37 +17,36 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 @router.get("")
 async def list_orders(
     limit: int = 100,
+    environment: str | None = None,
     db: AsyncSession = Depends(get_db_session),
+    runner: ContinuousStrategyRunner = Depends(get_strategy_runner),
 ) -> list[dict[str, Any]]:
-    # Map positions to strategy names
+    """Recent orders on one environment's Binance account (default: the active one)."""
+    try:
+        env = TradingEnvironment(environment.upper().strip()) if environment else runner.environment
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="environment must be DEMO or LIVE") from exc
+
     strat_stmt = select(StrategyConfig)
     strats = {s.id: s.name for s in (await db.execute(strat_stmt)).scalars().all()}
-    pos_stmt = select(Position)
-    pos_map = {p.id: p.strategy_id for p in (await db.execute(pos_stmt)).scalars().all()}
-
-    def get_order_strat(o: Order) -> tuple[str, str]:
-        s_id = pos_map.get(o.position_id)
-        name = strats.get(s_id, "")
-        if not name:
-            cid = o.client_order_id or ""
-            if "1e678841" in cid:
-                name = "Smart DCA Scale-In"
-            elif "0efe0031" in cid:
-                name = "BTC/ETH EMA RSI Trend"
-            elif "ba77b92f" in cid:
-                name = "SOL Volatility Breakout"
-            else:
-                name = "Smart DCA Scale-In"
-        abbr = "DCA" if "DCA" in name else ("EMA" if "EMA" in name else ("BB" if "Breakout" in name or "BB" in name else "STRAT"))
-        return name, abbr
 
     stmt = (
-        select(Order)
+        select(Order, Position.strategy_id)
+        .join(Position, Position.id == Order.position_id)
+        .where(Position.execution_mode == env.value)
         .options(selectinload(Order.fills))
         .order_by(Order.created_at.desc())
         .limit(min(limit, 200))
     )
-    orders = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt)).all()
+    pos_map = {o.position_id: strategy_id for o, strategy_id in rows}
+
+    def get_order_strat(o: Order) -> tuple[str, str]:
+        name = strats.get(pos_map.get(o.position_id), "") or "Manual / Unknown"
+        abbr = "DCA" if "DCA" in name else ("EMA" if "EMA" in name else ("BB" if "Breakout" in name or "BB" in name else "STRAT"))
+        return name, abbr
+
+    orders = [o for o, _ in rows]
     results = []
     for o in orders:
         s_name, s_abbr = get_order_strat(o)

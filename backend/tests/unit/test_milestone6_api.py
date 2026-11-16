@@ -158,3 +158,39 @@ def test_strategy_management_and_webhook_signal() -> None:
 
     import asyncio
     asyncio.run(_test())
+
+
+def test_hidden_strategies_are_unlisted_and_cannot_run() -> None:
+    async def _test() -> None:
+        async with create_test_client() as client:
+            payload = {
+                "strategy_class": "ema_rsi_atr",
+                "market_type": "FUTURES_USDT",
+                "symbols": ["BTC/USDT"],
+                "timeframe": "15m",
+                "is_active": True,
+            }
+            old_id = (await client.post("/api/v1/strategies", json={**payload, "name": "Old"})).json()["id"]
+            keep_id = (await client.post("/api/v1/strategies", json={**payload, "name": "Keep"})).json()["id"]
+
+            # Hiding a running strategy also stops it.
+            hidden = await client.patch(f"/api/v1/strategies/{old_id}", json={"is_hidden": True})
+            assert hidden.status_code == 200
+            assert hidden.json()["is_hidden"] is True
+            assert hidden.json()["is_active"] is False
+
+            listed = (await client.get("/api/v1/strategies")).json()
+            assert [s["id"] for s in listed] == [keep_id]
+
+            # The row is kept and can still be fetched on request.
+            everything = (await client.get("/api/v1/strategies", params={"include_hidden": True})).json()
+            assert {s["id"] for s in everything} == {old_id, keep_id}
+
+            # A hidden strategy cannot be switched back on without being unhidden first.
+            blocked = await client.patch(f"/api/v1/strategies/{old_id}", json={"is_active": True})
+            assert blocked.status_code == 400
+            assert (await client.patch(f"/api/v1/strategies/{old_id}", json={"is_hidden": False})).status_code == 200
+            assert (await client.patch(f"/api/v1/strategies/{old_id}", json={"is_active": True})).json()["is_active"] is True
+
+    import asyncio
+    asyncio.run(_test())

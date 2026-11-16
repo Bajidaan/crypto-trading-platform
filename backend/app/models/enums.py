@@ -17,11 +17,27 @@ class MarketType(StrEnum):
     FUTURES_USDT = "FUTURES_USDT"
 
 
+class TradingEnvironment(StrEnum):
+    """Which Binance account the engine trades on.
+
+    DEMO is Binance Demo Trading (demo-api / demo-fapi, demo funds); LIVE is the real
+    account. The app runs in exactly one at a time and can be switched between them.
+    """
+
+    DEMO = "DEMO"
+    LIVE = "LIVE"
+
+
 class ExecutionMode(StrEnum):
-    """Execution mode for strategies, positions, and orders."""
+    """Where a position was executed. DEMO and LIVE match TradingEnvironment.
+
+    PAPER marks rows from the removed in-app paper simulator; they are kept as history
+    but no longer shown or created.
+    """
 
     BACKTEST = "BACKTEST"
     PAPER = "PAPER"
+    DEMO = "DEMO"
     LIVE = "LIVE"
 
 

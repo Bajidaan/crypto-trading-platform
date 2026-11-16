@@ -34,6 +34,7 @@ class CreateStrategyRequest(BaseModel):
 
 class UpdateStrategyRequest(BaseModel):
     is_active: bool | None = None
+    is_hidden: bool | None = None
     timeframe: str | None = None
     symbols: list[str] | None = None
     execution_mode: str | None = None
@@ -66,9 +67,12 @@ async def list_available_strategy_classes() -> list[str]:
 
 @router.get("")
 async def list_strategies(
+    include_hidden: bool = False,
     db: AsyncSession = Depends(get_db_session),
 ) -> list[dict[str, Any]]:
     stmt = select(StrategyConfig).order_by(StrategyConfig.created_at.desc())
+    if not include_hidden:
+        stmt = stmt.where(StrategyConfig.is_hidden == False)  # noqa: E712
     strats = (await db.execute(stmt)).scalars().all()
     return [
         {
@@ -83,6 +87,7 @@ async def list_strategies(
             "parameters": s.parameters,
             "risk_config": s.risk_config,
             "is_active": s.is_active,
+            "is_hidden": s.is_hidden,
             "created_at": s.created_at.isoformat(),
         }
         for s in strats
@@ -137,8 +142,16 @@ async def update_strategy(
     if not strat:
         raise HTTPException(status_code=404, detail="Strategy not found.")
 
-    if req.is_active is not None:
-        strat.is_active = req.is_active
+    if req.is_hidden is not None:
+        strat.is_hidden = req.is_hidden
+        if req.is_hidden:
+            strat.is_active = False  # a hidden strategy must never keep running unseen
+    if req.is_active:
+        if strat.is_hidden:
+            raise HTTPException(status_code=400, detail="A hidden strategy cannot be activated; unhide it first.")
+        strat.is_active = True
+    elif req.is_active is not None:
+        strat.is_active = False
     if req.timeframe is not None:
         strat.timeframe = req.timeframe.strip()
     if req.symbols is not None:
@@ -165,6 +178,7 @@ async def update_strategy(
         "parameters": strat.parameters,
         "risk_config": strat.risk_config,
         "is_active": strat.is_active,
+        "is_hidden": strat.is_hidden,
         "created_at": strat.created_at.isoformat(),
     }
 

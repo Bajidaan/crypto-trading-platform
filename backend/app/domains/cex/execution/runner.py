@@ -1,10 +1,14 @@
 """Continuous Background Strategy Runner and Real-Time Market Feeder.
 
 Strategies are evaluated the moment Binance reports a candle closed (kline WebSocket). A
-REST poll every `poll_interval_seconds` refreshes the strategy list, keeps the stream
-subscriptions current, polls any symbol whose stream is stale, and checks live exchange
-stops for fills. Signals go to the paper broker or, for strategies in LIVE mode, to the
-exchange through `LiveExecutionBroker`.
+housekeeping loop every `poll_interval_seconds` refreshes the strategy list, keeps the
+stream subscriptions current, polls any symbol whose stream is stale, checks exchange stops
+for fills and refreshes the account balance.
+
+Every signal is executed on Binance through `LiveExecutionBroker`, on the account of the
+active environment: DEMO (Binance Demo Trading) or LIVE (the real account). Switching the
+environment only redirects new entries; positions already open on the other environment
+stay protected (stop-fill checks and breakeven moves keep running for them).
 """
 
 import asyncio
@@ -31,12 +35,10 @@ from app.domains.cex.adapters.base import (
     CandleBar,
     IExchangeAdapter,
     MarketRules,
-    NormalizedOrderRequest,
 )
 from app.domains.cex.adapters.binance import BinanceAdapter
 from app.domains.cex.adapters.factory import ExchangeAdapterFactory
 from app.domains.cex.execution.live_broker import LiveExecutionBroker
-from app.domains.cex.execution.paper_broker import PaperTradingBroker
 from app.domains.cex.execution.sl_tp_manager import HybridSlTpManager
 from app.domains.cex.market_data.binance_ws import BinanceKlineStream, KlineKey
 from app.domains.cex.market_data.buffer import CandleBuffer
@@ -44,7 +46,7 @@ from app.domains.cex.risk.gatekeeper import RiskGatekeeper
 from app.domains.cex.risk.position_sizer import PositionSizer
 from app.domains.cex.strategies.base import IStrategy
 from app.domains.cex.strategies.registry import StrategyRegistry
-from app.models.entities import ExchangeConnection, Fill, Order, Position, StrategyConfig
+from app.models.entities import ExchangeConnection, Order, Position, StrategyConfig
 from app.models.enums import (
     ExchangeId,
     ExecutionMode,
@@ -57,12 +59,16 @@ from app.models.enums import (
     PositionSide,
     PositionStatus,
     SignalAction,
+    TradingEnvironment,
 )
 
 logger = logging.getLogger(__name__)
 
-# Live ticks arrive every ~250 ms per futures stream; dashboard updates, paper SL/TP checks
-# and Tier-2 checks are rate-limited to this interval per kline.
+# Execution modes of positions placed on Binance (as opposed to legacy paper rows).
+EXCHANGE_MODES = (ExecutionMode.DEMO.value, ExecutionMode.LIVE.value)
+
+# Live ticks arrive every ~250 ms per futures stream; dashboard updates and Tier-2 checks
+# are rate-limited to this interval per kline.
 TICK_THROTTLE_SEC = 1.0
 # A chart symbol keeps streaming this long after the dashboard last asked for it.
 CHART_WATCH_TTL_SEC = 600.0
@@ -71,13 +77,12 @@ CHART_REST_REFRESH_SEC = 5.0
 
 
 class ContinuousStrategyRunner:
-    """Continuously evaluates active strategies against live market candles and executes paper/live trades."""
+    """Evaluates active strategies on live market candles and trades them on Binance."""
 
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
         event_bus: EventBus,
-        paper_broker: PaperTradingBroker,
         risk_gatekeeper: RiskGatekeeper,
         adapter_factory: ExchangeAdapterFactory,
         poll_interval_seconds: float = 15.0,
@@ -86,10 +91,11 @@ class ContinuousStrategyRunner:
         enable_kline_stream: bool = True,
         kline_stream_factory: Callable[..., BinanceKlineStream] | None = None,
         market_data_adapter: IExchangeAdapter | None = None,
+        environment: TradingEnvironment = TradingEnvironment.DEMO,
     ) -> None:
         self.session_factory = session_factory
         self.event_bus = event_bus
-        self.paper_broker = paper_broker
+        self.environment = TradingEnvironment(environment)
         self.risk_gatekeeper = risk_gatekeeper
         self.adapter_factory = adapter_factory
         self.poll_interval = poll_interval_seconds
@@ -121,7 +127,89 @@ class ContinuousStrategyRunner:
         self._day_start_equity: dict[tuple[str, MarketType], tuple[date, Decimal]] = {}
         self._position_connection: dict[str, str] = {}
 
+        # Latest traded price per (symbol, market), from the kline stream or REST polls.
+        self._last_price: dict[tuple[str, MarketType], Decimal] = {}
+        # Balance of the active environment's account, refreshed every housekeeping cycle.
+        self._account: dict[str, Any] = {}
+
         self.event_bus.subscribe(PositionUpdatedEvent, self._handle_position_closed)
+
+    # ================================================================== environment
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Execution mode that positions opened now are recorded with."""
+        return ExecutionMode(self.environment.value)
+
+    async def set_environment(self, environment: TradingEnvironment) -> None:
+        """Send new entries to another Binance account. Open positions elsewhere stay managed."""
+        environment = TradingEnvironment(environment)
+        if environment == self.environment:
+            return
+        logger.warning("Trading environment switched %s -> %s.", self.environment.value, environment.value)
+        self.environment = environment
+        self._account = {}
+        await self._refresh_account()
+
+    async def connection_for_environment(
+        self, environment: TradingEnvironment | None = None
+    ) -> ExchangeConnection | None:
+        """The enabled Binance API key of an environment (newest first)."""
+        env = TradingEnvironment(environment or self.environment)
+        async with self.session_factory() as session:
+            return (
+                await session.execute(
+                    select(ExchangeConnection)
+                    .where(
+                        ExchangeConnection.environment == env.value,
+                        ExchangeConnection.is_enabled == True,  # noqa: E712
+                        ExchangeConnection.exchange_id == ExchangeId.BINANCE.value,
+                    )
+                    .order_by(ExchangeConnection.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+    def last_price(self, symbol: str, market_type: MarketType) -> Decimal | None:
+        return self._last_price.get((symbol, market_type))
+
+    @property
+    def account(self) -> dict[str, Any]:
+        """Last balance snapshot of the active environment (see `_refresh_account`)."""
+        return dict(self._account)
+
+    async def _refresh_account(self) -> None:
+        """Read the active environment's Binance balances for the dashboard header."""
+        env = self.environment
+        conn = await self.connection_for_environment(env)
+        if conn is None:
+            self._account = {"environment": env.value, "connection_id": None, "connection_label": None,
+                             "balances": {}, "error": None, "updated_at": None}
+            return
+        snapshot: dict[str, Any] = {
+            "environment": env.value,
+            "connection_id": conn.id,
+            "connection_label": conn.label,
+            "balances": {},
+            "error": None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        adapter = await self._get_live_adapter(conn.id)
+        if adapter is None:
+            snapshot["error"] = "Could not open the exchange connection."
+        else:
+            for mt in (MarketType.FUTURES_USDT, MarketType.SPOT):
+                try:
+                    bal = await adapter.fetch_balance(mt)
+                    snapshot["balances"][mt.value] = {
+                        "total_equity": bal.total_equity,
+                        "available_balance": bal.available_balance,
+                        "unrealized_pnl": bal.unrealized_pnl,
+                    }
+                except Exception as exc:
+                    snapshot["error"] = f"{mt.value} balance: {exc}"
+        if self.environment == env:  # not switched meanwhile
+            self._account = snapshot
 
     # ================================================================== lifecycle
 
@@ -157,10 +245,6 @@ class ContinuousStrategyRunner:
             self._task = None
         for task in list(self._eval_tasks):
             task.cancel()
-        try:
-            await self.paper_broker.flush_marks_to_db()
-        except Exception as exc:
-            logger.warning("Final paper mark flush failed: %s", exc)
         if self._default_adapter and self._owns_default_adapter:
             await self._default_adapter.close()
             self._default_adapter = None
@@ -301,11 +385,11 @@ class ContinuousStrategyRunner:
                 logger.error("Live position sync failed: %s", exc, exc_info=True)
 
             try:
-                await self.paper_broker.flush_marks_to_db()
+                await self._refresh_account()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning("Paper mark flush failed: %s", exc)
+                logger.warning("Account balance refresh failed: %s", exc)
 
             try:
                 await asyncio.sleep(self.poll_interval)
@@ -468,16 +552,10 @@ class ContinuousStrategyRunner:
             buffer.update_or_append(c)
 
         latest_candle = candles[-1]
+        self._last_price[(symbol, market_type)] = latest_candle.close
+        await self._live_tick(symbol, latest_candle.close)
 
-        # 3. Trigger SL/TP checks on active paper positions using latest high/low
-        await self.paper_broker.on_price_update(
-            symbol=symbol,
-            high=latest_candle.high,
-            low=latest_candle.low,
-            close=latest_candle.close,
-        )
-
-        # 3b. Broadcast live candle event for dashboard charts and ticker displays
+        # 3. Broadcast live candle event for dashboard charts and ticker displays
         await self.event_bus.publish(
             MarketCandleEvent(
                 exchange_id=ExchangeId.BINANCE,
@@ -550,18 +628,13 @@ class ContinuousStrategyRunner:
                 await self._process_signal(sig, cfg, current_price)
 
     async def _position_state_for(self, cfg: StrategyConfig) -> dict[str, PositionSide]:
-        if cfg.execution_mode != ExecutionMode.LIVE.value:
-            return {
-                p.symbol: p.side
-                for p in self.paper_broker.positions
-                if p.strategy_id == cfg.id and p.status == PositionStatus.OPEN
-            }
+        """The strategy's open positions on the active environment's account."""
         async with self.session_factory() as session:
             rows = (
                 await session.execute(
                     select(Position).where(
                         Position.strategy_id == cfg.id,
-                        Position.execution_mode == ExecutionMode.LIVE.value,
+                        Position.execution_mode == self.execution_mode.value,
                         Position.status == PositionStatus.OPEN.value,
                     )
                 )
@@ -575,14 +648,12 @@ class ContinuousStrategyRunner:
         key: KlineKey = (event.symbol, event.timeframe, event.market_type)
         buffer = self._get_buffer(event.symbol, event.timeframe, event.market_type)
         buffer.update_or_append(event)
+        self._last_price[(event.symbol, event.market_type)] = event.close
 
         now = time.monotonic()
         if event.is_closed or now - self._last_tick_at.get(key, 0.0) >= TICK_THROTTLE_SEC:
             self._last_tick_at[key] = now
             await self.event_bus.publish(event)
-            await self.paper_broker.on_price_update(
-                symbol=event.symbol, high=event.high, low=event.low, close=event.close
-            )
             await self._live_tick(event.symbol, event.close)
 
         if not event.is_closed:
@@ -695,11 +766,8 @@ class ContinuousStrategyRunner:
         cfg: StrategyConfig,
         current_price: Decimal,
     ) -> None:
-        """Route a signal to the live exchange or the paper broker based on the strategy's mode."""
-        if cfg.execution_mode == ExecutionMode.LIVE.value:
-            await self._process_live_signal(sig, cfg, current_price)
-        else:
-            await self._process_paper_signal(sig, cfg, current_price)
+        """Execute a strategy signal on Binance, on the active environment's account."""
+        await self._process_live_signal(sig, cfg, current_price)
 
     def _compute_quantity(
         self,
@@ -710,7 +778,7 @@ class ContinuousStrategyRunner:
         rules: MarketRules,
         leverage: int,
     ) -> Decimal | None:
-        """Order size shared by paper and live: target weight, fixed USD size, or risk-based."""
+        """Order size: target weight, fixed USD size, or risk-based."""
         risk_cfg = cfg.risk_config or {}
         max_notional_usd = to_decimal(risk_cfg.get("max_notional_usd", "5000.0"))
         base_size_usd = cfg.parameters.get("base_order_size_usd") if cfg.parameters else None
@@ -808,7 +876,6 @@ class ContinuousStrategyRunner:
                 await session.execute(
                     select(Position).where(
                         Position.status == PositionStatus.OPEN.value,
-                        Position.execution_mode == ExecutionMode.LIVE.value,
                         Position.exchange_connection_id == connection_id,
                     )
                 )
@@ -826,19 +893,49 @@ class ContinuousStrategyRunner:
             return equity
         return recorded[1]
 
-    async def _open_live_positions(self, connection_id: str) -> list[Position]:
+    async def _open_positions(self, execution_mode: ExecutionMode | None = None) -> list[Position]:
+        """Open exchange positions of one environment (default: the active one)."""
+        mode = execution_mode or self.execution_mode
         async with self.session_factory() as session:
             return list(
                 (
                     await session.execute(
                         select(Position).where(
                             Position.status == PositionStatus.OPEN.value,
-                            Position.execution_mode == ExecutionMode.LIVE.value,
-                            Position.exchange_connection_id == connection_id,
+                            Position.execution_mode == mode.value,
                         )
                     )
                 ).scalars().all()
             )
+
+    async def _close_strategy_positions(self, sig: TradeSignalEvent) -> None:
+        """Strategy exit: flatten the strategy's position on the symbol, in either environment.
+
+        A position opened before an environment switch still belongs to the strategy, so its
+        exit signal closes it on the account it lives on.
+        """
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(Position).where(
+                        Position.status == PositionStatus.OPEN.value,
+                        Position.execution_mode.in_(EXCHANGE_MODES),
+                        Position.strategy_id == sig.strategy_id,
+                        Position.symbol == sig.symbol,
+                        Position.side == sig.side.value,
+                    )
+                )
+            ).scalars().all()
+        for pos in rows:
+            adapter = await self._get_live_adapter(pos.exchange_connection_id)
+            if adapter is None:
+                logger.error("Cannot close %s position %s: its API key is missing or disabled.", pos.symbol, pos.id[:8])
+                continue
+            logger.info(
+                "Closing %s position %s on %s (strategy exit: %s)",
+                pos.execution_mode, pos.id[:8], sig.symbol, sig.metadata.get("exit_trigger", "STRATEGY_EXIT"),
+            )
+            await self.live_broker.close_position(adapter, pos.id, exit_reason="STRATEGY_EXIT")  # type: ignore[union-attr]
 
     async def _process_live_signal(
         self,
@@ -846,39 +943,39 @@ class ContinuousStrategyRunner:
         cfg: StrategyConfig,
         current_price: Decimal,
     ) -> None:
-        """Validate, size and place a real order on the strategy's exchange connection."""
+        """Validate, size and place an order on the active environment's Binance account."""
         if self.live_broker is None:
-            logger.error("Strategy %s is LIVE but no live broker is configured; signal dropped.", cfg.name)
-            return
-        conn_id = cfg.exchange_connection_id
-        adapter = await self._get_live_adapter(conn_id)
-        if adapter is None or conn_id is None:
-            msg = f"LIVE strategy {cfg.name} has no enabled exchange connection; signal on {sig.symbol} dropped."
-            logger.error(msg)
-            await self.event_bus.publish(
-                RiskAlertEvent(severity="CRITICAL", rule_name="LIVE_CONNECTION_MISSING", message=msg)
-            )
+            logger.error("No exchange broker is configured; signal on %s from %s dropped.", sig.symbol, cfg.name)
             return
 
         market_type = MarketType(cfg.market_type)
-        sig = sig.model_copy(update={"market_type": market_type, "execution_mode": ExecutionMode.LIVE})
-        open_positions = await self._open_live_positions(conn_id)
+        env_mode = self.execution_mode
+        sig = sig.model_copy(update={"market_type": market_type, "execution_mode": env_mode})
 
-        # Strategy-driven exit: flatten this strategy's live position on the symbol.
         if sig.action == SignalAction.EXIT:
-            for pos in open_positions:
-                if pos.strategy_id == sig.strategy_id and pos.symbol == sig.symbol and pos.side == sig.side.value:
-                    logger.info(
-                        "Closing LIVE position %s on %s (strategy exit: %s)",
-                        pos.id[:8], sig.symbol, sig.metadata.get("exit_trigger", "STRATEGY_EXIT"),
-                    )
-                    await self.live_broker.close_position(adapter, pos.id, exit_reason="STRATEGY_EXIT")
+            await self._close_strategy_positions(sig)
             return
 
+        conn = await self.connection_for_environment()
+        conn_id = conn.id if conn else None
+        adapter = await self._get_live_adapter(conn_id)
+        if adapter is None or conn_id is None:
+            msg = (
+                f"No enabled {self.environment.value} Binance API key; {cfg.name} signal on "
+                f"{sig.symbol} was not traded. Add one under API Keys."
+            )
+            logger.error(msg)
+            await self.event_bus.publish(
+                RiskAlertEvent(severity="CRITICAL", rule_name="ENVIRONMENT_CONNECTION_MISSING", message=msg)
+            )
+            return
+
+        open_positions = await self._open_positions(env_mode)
+
         if isinstance(sig.metadata, dict) and sig.metadata.get("dca_order_type") == "SAFETY_SCALE_IN":
-            # Scaling in live needs the exchange stop resized to the new quantity; until that
+            # Scaling in needs the exchange stop resized to the new quantity; until that
             # exists, refuse rather than leave part of the position unprotected.
-            logger.warning("DCA scale-in is not supported in LIVE mode yet; signal on %s skipped.", sig.symbol)
+            logger.warning("DCA scale-in is not supported on the exchange yet; signal on %s skipped.", sig.symbol)
             return
 
         try:
@@ -932,10 +1029,11 @@ class ContinuousStrategyRunner:
                     return
 
         logger.info(
-            "Placing LIVE %s %s %s on %s (~%s)", sig.side.value, qty, sig.symbol, adapter.exchange_id.value, current_price
+            "Placing %s %s %s %s on %s (~%s)",
+            env_mode.value, sig.side.value, qty, sig.symbol, adapter.exchange_id.value, current_price,
         )
         resp = await self.live_broker.execute_entry_signal(
-            adapter=adapter, signal=sig, quantity=qty, exchange_connection_id=conn_id
+            adapter=adapter, signal=sig, quantity=qty, exchange_connection_id=conn_id, environment=env_mode
         )
         if resp is not None:
             await self._restore_live_protections(conn_id)
@@ -951,7 +1049,7 @@ class ContinuousStrategyRunner:
                     await session.execute(
                         select(Position.exchange_connection_id).where(
                             Position.status == PositionStatus.OPEN.value,
-                            Position.execution_mode == ExecutionMode.LIVE.value,
+                            Position.execution_mode.in_(EXCHANGE_MODES),
                         )
                     )
                 ).scalars().all()
@@ -967,199 +1065,3 @@ class ContinuousStrategyRunner:
                     logger.info("Detected %d live stop-loss fill(s) on connection %s.", closed, conn_id)
             except Exception as exc:
                 logger.warning("Stop fill sync failed for connection %s: %s", conn_id, exc)
-
-    # ------------------------------------------------------------------ paper
-
-    async def _process_paper_signal(
-        self,
-        sig: TradeSignalEvent,
-        cfg: StrategyConfig,
-        current_price: Decimal,
-    ) -> None:
-        """Run signal through Risk Gatekeeper and execute a paper trade."""
-        # 0. Strategy-driven exit: close this strategy's open position on the symbol.
-        if sig.action == SignalAction.EXIT:
-            for pos in self.paper_broker.positions:
-                if (
-                    pos.strategy_id == sig.strategy_id
-                    and pos.symbol == sig.symbol
-                    and pos.side == sig.side
-                    and pos.status == PositionStatus.OPEN
-                ):
-                    logger.info(
-                        "ContinuousStrategyRunner closing paper position %s on %s (strategy exit: %s)",
-                        pos.position_id[:8],
-                        sig.symbol,
-                        sig.metadata.get("exit_trigger", "STRATEGY_EXIT"),
-                    )
-                    await self.paper_broker.close_position_market(
-                        pos.position_id,
-                        exit_price=current_price,
-                        exit_reason="STRATEGY_EXIT",
-                    )
-            return
-
-        # 1. Gather all active positions from broker AND database for 100% accurate concentration checks
-        active_positions = list(self.paper_broker.positions)
-        if self.session_factory:
-            try:
-                async with self.session_factory() as session:
-                    stmt = select(Position).where(Position.status == PositionStatus.OPEN.value)
-                    db_open = (await session.execute(stmt)).scalars().all()
-                    known_ids = {p.position_id for p in active_positions if hasattr(p, "position_id")}
-                    for db_pos in db_open:
-                        if db_pos.id not in known_ids:
-                            active_positions.append(db_pos)
-            except Exception as exc:
-                logger.debug("Runner position sync check: %s", exc)
-
-        # Gatekeeper validation with Concentration Guard (Max 1 position per symbol across account)
-        approved, reject_reason = await self.risk_gatekeeper.evaluate_signal(
-            signal=sig,
-            open_positions_count=len(active_positions),
-            current_equity=self.paper_broker.total_equity,
-            daily_starting_equity=self.paper_broker.total_equity,
-            existing_positions=active_positions,
-            max_positions_per_symbol=1,
-        )
-
-        if not approved:
-            logger.info("Signal for %s rejected by Risk Gatekeeper: %s", sig.symbol, reject_reason)
-            return
-
-        # 2. Determine position size
-        base_size_usd = cfg.parameters.get("base_order_size_usd") if cfg.parameters else None
-        is_dca_scale_in = isinstance(sig.metadata, dict) and sig.metadata.get("dca_order_type") == "SAFETY_SCALE_IN"
-        dummy_rules = MarketRules(
-            symbol=sig.symbol,
-            exchange_symbol=sig.symbol.replace("/", ""),
-            market_type=sig.market_type,
-            base_asset=sig.symbol.split("/")[0],
-            quote_asset="USDT",
-            min_qty=Decimal("0.001"),
-            max_qty=Decimal("1000"),
-            step_size=Decimal("0.001"),
-            tick_size=Decimal("0.01"),
-            min_notional=Decimal("10.0"),
-            max_leverage=10,
-        )
-        qty = self._compute_quantity(sig, cfg, self.paper_broker.total_equity, current_price, dummy_rules, leverage=2)
-        if qty is None:
-            return
-
-        # 3. Check if scaling into an existing open DCA position
-        existing_strat_pos = next(
-            (
-                p for p in self.paper_broker.positions
-                if p.strategy_id == sig.strategy_id and p.symbol == sig.symbol
-            ),
-            None,
-        )
-
-        pos_id = existing_strat_pos.position_id if (is_dca_scale_in and existing_strat_pos) else str(uuid.uuid4())
-        order_purpose = OrderPurpose.DCA_SAFETY if (is_dca_scale_in and existing_strat_pos) else OrderPurpose.ENTRY
-
-        # Execute in paper broker
-        side = OrderSide.BUY if sig.side == PositionSide.LONG else OrderSide.SELL
-        order_req = NormalizedOrderRequest(
-            # Unique per order: the old `cid-{strategy}-{HHMMSS}` collided when one strategy
-            # filled two symbols in the same second, and the second trade was never saved.
-            client_order_id=f"cid-{sig.strategy_id[:8]}-{uuid.uuid4().hex[:20]}",
-            symbol=sig.symbol,
-            market_type=sig.market_type,
-            side=side,
-            order_type=OrderType.MARKET,
-            purpose=order_purpose,
-            quantity=qty,
-            stop_price=sig.stop_loss_price,
-        )
-
-        logger.info(
-            "ContinuousStrategyRunner executing paper order (%s): %s %s %s @ %s",
-            order_purpose.value,
-            side.value,
-            qty,
-            sig.symbol,
-            current_price,
-        )
-        resp = await self.paper_broker.submit_order(
-            request=order_req,
-            current_market_price=current_price,
-            strategy_id=sig.strategy_id,
-            position_id=pos_id,
-            tp_targets=sig.take_profit_targets,
-        )
-
-        # 4. Also persist to SQLite database for persistent display in OrdersTable & PositionsTable
-        try:
-            slip = Decimal("0.0005") if side == OrderSide.BUY else -Decimal("0.0005")
-            fill_price = current_price * (Decimal("1") + slip)
-            fee = qty * fill_price * Decimal("0.0005")
-
-            tp_state = [
-                {
-                    "target_index": t.target_index,
-                    "price": str(t.price),
-                    "close_dynamic_pct": str(t.close_dynamic_pct),
-                    "move_sl_to_breakeven": t.move_sl_to_breakeven,
-                }
-                for t in (sig.take_profit_targets or [])
-            ]
-
-            async with self.session_factory() as session:
-                if order_purpose == OrderPurpose.DCA_SAFETY:
-                    db_pos = (await session.execute(select(Position).where(Position.id == pos_id))).scalar_one_or_none()
-                    if db_pos:
-                        old_cost = db_pos.entry_price * db_pos.current_qty
-                        new_cost = fill_price * qty
-                        new_total_qty = db_pos.current_qty + qty
-                        db_pos.entry_price = (old_cost + new_cost) / new_total_qty
-                        db_pos.current_qty = new_total_qty
-                        db_pos.initial_qty += qty
-                        db_pos.total_fees_usd = (db_pos.total_fees_usd or Decimal("0")) + fee
-                        if tp_state:
-                            db_pos.take_profit_state = tp_state
-                else:
-                    db_pos = Position(
-                        id=pos_id,
-                        strategy_id=sig.strategy_id,
-                        execution_mode="PAPER",
-                        symbol=sig.symbol,
-                        market_type=sig.market_type.value,
-                        side=sig.side.value,
-                        margin_mode="ISOLATED",
-                        leverage=1 if (base_size_usd or sig.target_weight is not None) else 2,
-                        entry_price=fill_price,
-                        initial_qty=qty,
-                        current_qty=qty,
-                        stop_loss_price=sig.stop_loss_price,
-                        take_profit_state=tp_state,
-                        stop_order_live=True,
-                        unrealized_pnl_usd=Decimal("0"),
-                        realized_pnl_usd=Decimal("0"),
-                        total_fees_usd=fee,
-                        status="OPEN",
-                    )
-                    session.add(db_pos)
-
-                db_order = Order(
-                    id=resp.exchange_order_id,
-                    position_id=pos_id,
-                    client_order_id=order_req.client_order_id,
-                    exchange_order_id=resp.exchange_order_id,
-                    symbol=sig.symbol,
-                    market_type=sig.market_type.value,
-                    purpose=order_purpose.value,
-                    order_type="MARKET",
-                    side=side.value,
-                    status="FILLED",
-                    requested_qty=qty,
-                    filled_qty=qty,
-                    avg_fill_price=fill_price,
-                    fee_usd=fee,
-                )
-                session.add(db_order)
-                await session.commit()
-                logger.info("Persisted paper position %s and order %s (%s) to SQLite database.", pos_id, resp.exchange_order_id, order_purpose.value)
-        except Exception as db_err:
-            logger.warning("Failed to persist paper position to DB: %s", db_err)

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AnalyticsModal } from './components/AnalyticsModal';
 import { ConnectionsModal } from './components/ConnectionsModal';
 import { Header } from './components/Header';
@@ -16,6 +16,7 @@ import type {
   RiskAlertItem,
   StrategyItem,
   SystemStatus,
+  TradingEnvironment,
 } from './types';
 
 export const App: React.FC = () => {
@@ -31,31 +32,29 @@ export const App: React.FC = () => {
   const [backtestResult, setBacktestResult] = useState<any>(null);
   const [isConnectionsOpen, setIsConnectionsOpen] = useState<boolean>(false);
   const [isAnalyticsOpen, setIsAnalyticsOpen] = useState<boolean>(false);
+  // Active environment, readable inside WebSocket handlers registered once on mount.
+  const environmentRef = useRef<TradingEnvironment | null>(null);
+
+  const applyStatus = (s: SystemStatus | null) => {
+    setStatus(s);
+    environmentRef.current = s?.environment ?? null;
+  };
 
   // Initial load
   const refreshAllData = async () => {
     try {
       const [sysStatus, posList, ordList, stratList, connList] = await Promise.all([
         api.getSystemStatus().catch((err) => {
+          // No made-up numbers when the backend is down: the header shows dashes instead.
           console.warn('Backend not responding yet for system status:', err);
-          return {
-            is_paused: false,
-            kill_switch_active: false,
-            max_concurrent_positions: 5,
-            max_daily_drawdown_pct: 0,
-            max_leverage_cap: 10,
-            open_paper_positions: 1,
-            total_paper_equity: 10000,
-            active_stream_subscriptions: 1,
-            event_bus_published_count: 0,
-          };
+          return null;
         }),
         api.getPositions().catch(() => []),
         api.getOrders().catch(() => []),
         api.getStrategies().catch(() => []),
         api.getConnections().catch(() => []),
       ]);
-      setStatus(sysStatus);
+      applyStatus(sysStatus);
       setPositions(posList);
       setOrders(ordList);
       setStrategies(stratList);
@@ -75,6 +74,9 @@ export const App: React.FC = () => {
     // Subscriptions — WebSocket updates mark price and PnL in real-time
     const unsubPositions = wsService.subscribe('position', (msg) => {
       if (msg.data) {
+        // Positions of the other environment (still managed in the background) are not shown.
+        const env = environmentRef.current;
+        if (env && msg.data.execution_mode && msg.data.execution_mode !== env) return;
         // Map backend field name `position_id` to frontend `id` as well
         const patch = { ...msg.data, id: msg.data.id || msg.data.position_id };
         setPositions((prev) => {
@@ -121,7 +123,7 @@ export const App: React.FC = () => {
 
     // Periodic full refresh: status every 5s, positions every 5s (live mark price fallback)
     const interval = setInterval(() => {
-      api.getSystemStatus().then(setStatus).catch(() => {});
+      api.getSystemStatus().then(applyStatus).catch(() => {});
       // Full positions REST poll — guarantees mark price updates even without WS
       api.getPositions().then(setPositions).catch(() => {});
     }, 5000);
@@ -141,7 +143,7 @@ export const App: React.FC = () => {
     try {
       await api.pauseTrading();
       const updated = await api.getSystemStatus();
-      setStatus(updated);
+      applyStatus(updated);
     } catch (err: any) {
       alert(`Failed to pause: ${err.message}`);
     }
@@ -151,7 +153,7 @@ export const App: React.FC = () => {
     try {
       await api.resumeTrading();
       const updated = await api.getSystemStatus();
-      setStatus(updated);
+      applyStatus(updated);
     } catch (err: any) {
       alert(`Failed to resume: ${err.message}`);
     }
@@ -164,6 +166,14 @@ export const App: React.FC = () => {
     } catch (err: any) {
       alert(`Failed to activate kill switch: ${err.message}`);
     }
+  };
+
+  // Errors propagate to the header, which shows them next to the switch.
+  const handleSwitchEnvironment = async (env: TradingEnvironment) => {
+    await api.switchEnvironment(env, env === 'LIVE');
+    setPositions([]);
+    setOrders([]);
+    await refreshAllData();
   };
 
   const handleClosePosition = async (positionId: string) => {
@@ -208,11 +218,14 @@ export const App: React.FC = () => {
   const handleAddConnection = async (payload: any) => {
     const conn = await api.createConnection(payload);
     setConnections((prev) => [conn, ...prev]);
+    // A new key can change the active account's balance and label in the header.
+    api.getSystemStatus().then(applyStatus).catch(() => {});
   };
 
   const handleDeleteConnection = async (id: string) => {
     await api.deleteConnection(id);
     setConnections((prev) => prev.filter((c) => c.id !== id));
+    api.getSystemStatus().then(applyStatus).catch(() => {});
   };
 
   return (
@@ -226,6 +239,7 @@ export const App: React.FC = () => {
         onKillSwitch={handleKillSwitch}
         onOpenConnections={() => setIsConnectionsOpen(true)}
         onOpenAnalytics={() => setIsAnalyticsOpen(true)}
+        onSwitchEnvironment={handleSwitchEnvironment}
       />
 
       {/* Main Terminal View */}

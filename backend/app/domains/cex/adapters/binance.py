@@ -107,9 +107,14 @@ class BinanceAdapter(IExchangeAdapter):
     """Asynchronous Binance adapter supporting both Spot and USDT-M Perpetual Futures."""
 
     SPOT_LIVE_URL = "https://api.binance.com"
-    SPOT_TESTNET_URL = "https://testnet.binance.vision"
     FUTURES_LIVE_URL = "https://fapi.binance.com"
-    FUTURES_TESTNET_URL = "https://testnet.binancefuture.com"
+    # Binance Demo Trading (keys created on demo.binance.com). `is_testnet=True` selects these.
+    # The old spot testnet (testnet.binance.vision) is a separate system whose keys do not
+    # work here, and Binance now documents demo-fapi as the USD-M futures test endpoint.
+    SPOT_DEMO_URL = "https://demo-api.binance.com"
+    FUTURES_DEMO_URL = "https://demo-fapi.binance.com"
+    SPOT_TESTNET_URL = SPOT_DEMO_URL
+    FUTURES_TESTNET_URL = FUTURES_DEMO_URL
 
     def __init__(
         self,

@@ -145,8 +145,13 @@ export const TradingViewChart: React.FC<ChartProps> = ({
               chart.timeScale().fitContent();
               isFirstLoad = false;
             } else {
-              // Update last 2 candles incrementally without resetting user zoom
+              // Update the last 2 candles without resetting user zoom. The live stream may
+              // already have drawn a newer bar; the chart rejects updates to older bars, so
+              // only bars at or after the newest drawn one are applied.
+              const drawn = candleSeries.data();
+              const newestDrawn = drawn.length ? Number(drawn[drawn.length - 1].time) : -Infinity;
               for (let i = Math.max(0, candleData.length - 2); i < candleData.length; i++) {
+                if (Number(candleData[i].time) < newestDrawn) continue;
                 candleSeries.update(candleData[i]);
                 volumeSeries.update(volumeData[i]);
               }

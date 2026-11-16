@@ -102,7 +102,7 @@ export const PositionsTable: React.FC<PositionsTableProps> = ({
                             className={`text-[10px] px-1.5 py-0.2 rounded font-semibold ${
                               p.execution_mode === 'LIVE'
                                 ? 'bg-rose-500/20 text-rose-300'
-                                : 'bg-blue-500/20 text-blue-300'
+                                : 'bg-amber-500/20 text-amber-300'
                             }`}
                           >
                             {p.execution_mode}

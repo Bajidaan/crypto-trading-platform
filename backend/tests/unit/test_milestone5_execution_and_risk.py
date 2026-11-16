@@ -30,7 +30,6 @@ from app.domains.cex.adapters.base import (
 from app.domains.cex.execution import (
     HybridSlTpManager,
     LiveExecutionBroker,
-    PaperTradingBroker,
     StartupReconciler,
 )
 from app.domains.cex.risk import PositionSizer, RiskGatekeeper
@@ -336,61 +335,6 @@ def test_position_sizer_math_and_filters() -> None:
     )
     assert qty_small is None
     assert "minimum notional" in (err or "")
-
-
-# =====================================================================
-# 4. Paper Trading Broker Simulation Tests
-# =====================================================================
-
-
-async def test_paper_trading_broker_simulation() -> None:
-    bus = EventBus()
-    broker = PaperTradingBroker(
-        event_bus=bus,
-        initial_balance_usd=Decimal("10000.00"),
-        taker_fee=Decimal("0.0005"),
-        slippage_pct=Decimal("0.0005"),
-    )
-
-    req = NormalizedOrderRequest(
-        client_order_id="P_ENT_001",
-        symbol="BTC/USDT",
-        market_type=MarketType.FUTURES_USDT,
-        side=OrderSide.BUY,
-        order_type=OrderType.MARKET,
-        purpose=OrderPurpose.ENTRY,
-        quantity=Decimal("0.10"),
-        stop_price=Decimal("63000.00"),
-    )
-
-    tp_target = TakeProfitTargetSpec(
-        target_index=1,
-        price=Decimal("68000.00"),
-        close_dynamic_pct=Decimal("100"),
-    )
-
-    # 1. Submit Market Entry Order
-    resp = await broker.submit_order(
-        request=req,
-        current_market_price=Decimal("65000.00"),
-        strategy_id="strat-01",
-        tp_targets=[tp_target],
-    )
-    assert resp.status == OrderStatus.FILLED
-    assert broker.open_positions_count == 1
-    # Taker fee was deducted: notional ~6500 * 0.0005 = ~3.25
-    assert broker.total_equity < Decimal("10000.00")
-
-    # 2. Market price pumps to 68,500 (hits TP at 68,000)
-    await broker.on_price_update(
-        symbol="BTC/USDT",
-        high=Decimal("68500.00"),
-        low=Decimal("64800.00"),
-        close=Decimal("68200.00"),
-    )
-    assert broker.open_positions_count == 0
-    # Net realized gain realized: 0.10 * (68000 - 65000) ~ +300
-    assert broker.total_equity > Decimal("10250.00")
 
 
 # =====================================================================

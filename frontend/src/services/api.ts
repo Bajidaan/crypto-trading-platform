@@ -5,6 +5,7 @@ import type {
   PositionItem,
   StrategyItem,
   SystemStatus,
+  TradingEnvironment,
 } from '../types';
 import { BACKEND_PORT } from './backend';
 
@@ -55,6 +56,19 @@ export const api = {
     return handleResponse(res);
   },
 
+  // Point new trades at Binance Demo Trading or the real account. LIVE needs confirmLive.
+  async switchEnvironment(
+    environment: TradingEnvironment,
+    confirmLive: boolean = false
+  ): Promise<{ environment: TradingEnvironment; previous: TradingEnvironment; connection_label: string }> {
+    const res = await fetch(`${API_BASE}/system/environment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ environment, confirm_live: confirmLive }),
+    });
+    return handleResponse(res);
+  },
+
   // Positions
   async getPositions(): Promise<PositionItem[]> {
     const res = await fetch(`${API_BASE}/positions`);
@@ -89,7 +103,7 @@ export const api = {
       is_active?: boolean;
       timeframe?: string;
       symbols?: string[];
-      execution_mode?: 'PAPER' | 'LIVE';
+      market_type?: string;
       parameters?: Record<string, any>;
     }
   ): Promise<StrategyItem> {
@@ -126,7 +140,7 @@ export const api = {
     label: string;
     api_key: string;
     api_secret: string;
-    is_testnet: boolean;
+    environment: TradingEnvironment;
     spot_capital_cap_usd?: number;
     futures_capital_cap_usd?: number;
   }): Promise<ConnectionItem> {
