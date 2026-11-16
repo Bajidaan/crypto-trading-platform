@@ -1,14 +1,15 @@
 import type { WsMessage } from '../types';
+import { BACKEND_PORT } from './backend';
 
 export type WsHandler = (msg: WsMessage) => void;
 export type ConnectionStatusHandler = (status: 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED') => void;
 
 const getWsUrl = (): string => {
-  if (typeof window === 'undefined') return 'ws://localhost:8000/ws/stream';
+  if (typeof window === 'undefined') return `ws://localhost:${BACKEND_PORT}/ws/stream`;
   const { protocol, hostname, port } = window.location;
   const wsProto = protocol === 'https:' ? 'wss:' : 'ws:';
   if (port === '5173') {
-    return `${wsProto}//${hostname}:8000/ws/stream`;
+    return `${wsProto}//${hostname}:${BACKEND_PORT}/ws/stream`;
   }
   return `${wsProto}//${window.location.host}/ws/stream`;
 };

@@ -6,7 +6,7 @@ services:
     container_name: trading_backend
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8010:8000"  # host 8010 (8000 is often taken locally); container stays on 8000
     volumes:
       - trading_data:/app/data
     environment:

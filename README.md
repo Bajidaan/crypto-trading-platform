@@ -18,7 +18,7 @@ flowchart TD
         UI_WS["WebSocket Stream Client"]
     end
 
-    subgraph Gateway ["FastAPI Gateway (:8000)"]
+    subgraph Gateway ["FastAPI Gateway (:8010)"]
         REST_API["REST API /api/v1"]
         WS_HUB["WebSocket Broadcast Hub /ws/stream"]
         SEC_AUTH["HMAC Webhook Receiver"]
@@ -40,7 +40,7 @@ flowchart TD
         BYBIT["Bybit V5 Linear Futures"]
     end
 
-    UI_WS <-->|"ws://localhost:8000/ws/stream"| WS_HUB
+    UI_WS <-->|"ws://localhost:8010/ws/stream"| WS_HUB
     UI_Head <-->|"HTTP /api/v1"| REST_API
     REST_API --> BUS
     WS_HUB --> BUS
@@ -70,9 +70,9 @@ cd E:\Codes\crypto_trading_platform\backend
 python -m pytest tests/unit -v
 
 # Start FastAPI server
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
 ```
-The REST API will be available at `http://localhost:8000` with interactive OpenAPI documentation at `http://localhost:8000/docs`.
+The REST API will be available at `http://localhost:8010` with interactive OpenAPI documentation at `http://localhost:8010/docs`. Port 8010 avoids a clash with other local apps on 8000; to use another port, start uvicorn on it and set `VITE_BACKEND_PORT` in `frontend/.env.local`.
 
 **Database migrations** (Alembic, in `backend/migrations`) run automatically when the server starts. A database created before migrations existed is detected and upgraded in place. To run them by hand, or to add one after changing `app/models/entities.py`:
 ```powershell

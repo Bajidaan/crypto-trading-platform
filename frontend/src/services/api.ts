@@ -6,12 +6,13 @@ import type {
   StrategyItem,
   SystemStatus,
 } from '../types';
+import { BACKEND_PORT } from './backend';
 
 const getApiBase = (): string => {
-  if (typeof window === 'undefined') return 'http://localhost:8000/api/v1';
+  if (typeof window === 'undefined') return `http://localhost:${BACKEND_PORT}/api/v1`;
   const { protocol, hostname, port } = window.location;
   if (port === '5173') {
-    return `${protocol}//${hostname}:8000/api/v1`;
+    return `${protocol}//${hostname}:${BACKEND_PORT}/api/v1`;
   }
   return `${protocol}//${window.location.host}/api/v1`;
 };
