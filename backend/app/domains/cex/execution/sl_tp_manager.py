@@ -169,6 +169,54 @@ class HybridSlTpManager:
 
         return actions_taken
 
+    def restore_protection(self, position: Position) -> bool:
+        """Re-register Tier-2 tracking for a live position after an engine restart.
+
+        The Tier-1 stop is already on the exchange; this only rebuilds the in-memory state
+        (take-profit targets, breakeven flag) from the database row.
+        """
+        if position.id in self._protections or not position.active_stop_order_id:
+            return False
+        targets = [
+            TakeProfitTargetSpec(
+                target_index=int(t.get("target_index", i + 1)),
+                price=to_decimal(t["price"]),
+                close_dynamic_pct=to_decimal(t.get("close_dynamic_pct", "100")),
+                move_sl_to_breakeven=bool(t.get("move_sl_to_breakeven", False)),
+            )
+            for i, t in enumerate(position.take_profit_state or [])
+            if t.get("price") is not None
+        ]
+        side = PositionSide(position.side)
+        state = ManagedProtectionState(
+            position_id=position.id,
+            strategy_id=position.strategy_id or "",
+            symbol=position.symbol,
+            market_type=MarketType(position.market_type),
+            side=side,
+            entry_price=position.entry_price,
+            quantity=position.current_qty,
+            current_stop_price=position.stop_loss_price or Decimal("0"),
+            exchange_stop_order_id="",
+            stop_client_order_id=position.active_stop_order_id,
+            tp_targets=targets,
+        )
+        # A stop already at (or beyond) entry means breakeven was applied before the restart.
+        if position.stop_loss_price is not None:
+            state.breakeven_triggered = (
+                position.stop_loss_price >= position.entry_price
+                if side == PositionSide.LONG
+                else position.stop_loss_price <= position.entry_price
+            )
+        self._protections[position.id] = state
+        return True
+
+    def has_protection_for(self, symbol: str) -> bool:
+        return any(s.symbol == symbol for s in self._protections.values())
+
+    def protections_for(self, symbol: str) -> list[ManagedProtectionState]:
+        return [s for s in self._protections.values() if s.symbol == symbol]
+
     def unregister(self, position_id: str) -> None:
         """Remove protection tracking when position closes."""
         self._protections.pop(position_id, None)

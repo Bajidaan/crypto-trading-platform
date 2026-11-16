@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = None
     discord_webhook_url: str | None = None
 
+    # Market data & strategy runner
+    market_stream_enabled: bool = Field(
+        default=True,
+        description="Evaluate strategies from Binance's live kline WebSocket (REST polling is the fallback)",
+    )
+    strategy_poll_interval_seconds: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=300.0,
+        description="Housekeeping loop: strategy refresh, stale-stream polling and live stop-fill checks",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

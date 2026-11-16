@@ -12,6 +12,7 @@ from app.core.database import build_async_engine, build_session_factory
 from app.core.events import EventBus
 from app.core.security import CredentialVault
 from app.domains.cex.adapters.factory import ExchangeAdapterFactory
+from app.domains.cex.execution.live_broker import LiveExecutionBroker
 from app.domains.cex.execution.paper_broker import PaperTradingBroker
 from app.domains.cex.execution.runner import ContinuousStrategyRunner
 from app.domains.cex.execution.sl_tp_manager import HybridSlTpManager
@@ -36,13 +37,21 @@ class AppState:
         self.sl_tp_manager = HybridSlTpManager(event_bus=self.event_bus)
         self.paper_broker = PaperTradingBroker(event_bus=self.event_bus)
         self.stream_manager = MarketStreamManager(event_bus=self.event_bus)
+        self.live_broker = LiveExecutionBroker(
+            session_factory=self.session_factory,
+            event_bus=self.event_bus,
+            sl_tp_manager=self.sl_tp_manager,
+        )
         self.strategy_runner = ContinuousStrategyRunner(
             session_factory=self.session_factory,
             event_bus=self.event_bus,
             paper_broker=self.paper_broker,
             risk_gatekeeper=self.risk_gatekeeper,
             adapter_factory=self.adapter_factory,
-            poll_interval_seconds=15.0,
+            poll_interval_seconds=settings.strategy_poll_interval_seconds,
+            live_broker=self.live_broker,
+            sl_tp_manager=self.sl_tp_manager,
+            enable_kline_stream=settings.market_stream_enabled,
         )
 
 

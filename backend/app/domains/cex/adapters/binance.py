@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import hmac
+import logging
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -44,6 +45,24 @@ from app.models.enums import (
     OrderType,
     PositionSide,
 )
+
+
+logger = logging.getLogger(__name__)
+
+# Binance algo order states that mean the conditional order will never fire.
+_ALGO_TERMINAL_STATUS = {
+    "CANCELED": OrderStatus.CANCELED,
+    "CANCELLED": OrderStatus.CANCELED,
+    "EXPIRED": OrderStatus.EXPIRED,
+    "REJECTED": OrderStatus.REJECTED,
+}
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _to_binance_symbol(symbol: str) -> str:
@@ -112,6 +131,7 @@ class BinanceAdapter(IExchangeAdapter):
         self._external_client = http_client is not None
         self._client = http_client or httpx.AsyncClient(timeout=15.0)
         self._time_ms_fn = time_ms_fn or (lambda: int(time.time() * 1000))
+        self._time_offset_ms = 0
         self._markets_cache: dict[MarketType, dict[str, MarketRules]] = {
             MarketType.SPOT: {},
             MarketType.FUTURES_USDT: {},
@@ -139,14 +159,24 @@ class BinanceAdapter(IExchangeAdapter):
         ).hexdigest()
         return f"{query_string}&signature={signature}"
 
-    def _raise_mapped_error(self, status_code: int, payload: Any) -> None:
+    def _raise_mapped_error(
+        self, status_code: int, payload: Any, retry_after_header: str | None = None
+    ) -> None:
         code = payload.get("code") if isinstance(payload, dict) else None
+        if code is not None:
+            code = _int_or_zero(code)
         msg = payload.get("msg", str(payload)) if isinstance(payload, dict) else str(payload)
 
         if status_code in (429, 418) or code == -1003:
+            # Binance sends Retry-After on 429/418. Retrying earlier than that on a 418
+            # lengthens the IP ban, so honour it and fall back to 5s only when it is absent.
+            try:
+                retry_after = float(retry_after_header) if retry_after_header else 5.0
+            except ValueError:
+                retry_after = 5.0
             raise ExchangeRateLimitError(
                 f"Binance rate limit exceeded ({code}): {msg}",
-                retry_after_seconds=5.0,
+                retry_after_seconds=max(retry_after, 1.0),
                 exchange_id=ExchangeId.BINANCE,
                 error_code=code or status_code,
             )
@@ -186,6 +216,30 @@ class BinanceAdapter(IExchangeAdapter):
             error_code=code or status_code,
         )
 
+    def _server_time_ms(self) -> int:
+        """Local clock corrected by the last measured offset to Binance's server clock."""
+        return self._time_ms_fn() + self._time_offset_ms
+
+    @property
+    def time_offset_ms(self) -> int:
+        return self._time_offset_ms
+
+    async def sync_server_time(self, market_type: MarketType = MarketType.FUTURES_USDT) -> int:
+        """Measure the offset between the local clock and Binance's server clock.
+
+        Signed requests carry a timestamp that Binance rejects (-1021) when it is more than
+        `recvWindow` away from its own clock, so a drifting Windows clock would silently kill
+        every order. The offset is applied to all later signed requests.
+        """
+        path = "/api/v3/time" if market_type == MarketType.SPOT else "/fapi/v1/time"
+        sent_ms = self._time_ms_fn()
+        data = await self._request("GET", market_type, path, signed=False)
+        received_ms = self._time_ms_fn()
+        server_ms = int(data["serverTime"])
+        self._time_offset_ms = server_ms - (sent_ms + received_ms) // 2
+        logger.info("Binance clock offset measured: %+d ms", self._time_offset_ms)
+        return self._time_offset_ms
+
     async def _request(
         self,
         method: str,
@@ -194,37 +248,54 @@ class BinanceAdapter(IExchangeAdapter):
         params: dict[str, Any] | None = None,
         signed: bool = False,
     ) -> Any:
-        req_params = {k: v for k, v in (params or {}).items() if v is not None}
-        headers: dict[str, str] = {}
-        if signed:
-            headers["X-MBX-APIKEY"] = self._api_key
-            req_params["timestamp"] = self._time_ms_fn()
-            req_params.setdefault("recvWindow", 5000)
-            query = self._sign_params(req_params)
-            url = f"{self._base_url(market_type)}{path}?{query}"
-        else:
-            query = urlencode(req_params, doseq=True)
-            url = f"{self._base_url(market_type)}{path}" + (f"?{query}" if query else "")
+        base_params = {k: v for k, v in (params or {}).items() if v is not None}
+        # A signed request rejected for its timestamp (-1021) is re-synced and sent once more.
+        attempts = 2 if signed else 1
+        for attempt in range(attempts):
+            req_params = dict(base_params)
+            headers: dict[str, str] = {}
+            if signed:
+                headers["X-MBX-APIKEY"] = self._api_key
+                req_params["timestamp"] = self._server_time_ms()
+                req_params.setdefault("recvWindow", 5000)
+                query = self._sign_params(req_params)
+                url = f"{self._base_url(market_type)}{path}?{query}"
+            else:
+                query = urlencode(req_params, doseq=True)
+                url = f"{self._base_url(market_type)}{path}" + (f"?{query}" if query else "")
 
-        try:
-            response = await self._client.request(method=method.upper(), url=url, headers=headers)
-        except httpx.RequestError as exc:
-            raise ExchangeNetworkError(
-                f"Binance network request failed ({method} {path}): {exc}",
-                exchange_id=ExchangeId.BINANCE,
-            ) from exc
+            try:
+                response = await self._client.request(method=method.upper(), url=url, headers=headers)
+            except httpx.RequestError as exc:
+                raise ExchangeNetworkError(
+                    f"Binance network request failed ({method} {path}): {exc}",
+                    exchange_id=ExchangeId.BINANCE,
+                ) from exc
 
-        try:
-            payload = response.json()
-        except Exception:
-            payload = response.text
+            try:
+                payload = response.json()
+            except Exception:
+                payload = response.text
 
-        if response.status_code >= 400 or (
-            isinstance(payload, dict) and "code" in payload and int(payload["code"]) < 0
-        ):
-            self._raise_mapped_error(response.status_code, payload)
+            failed = response.status_code >= 400 or (
+                isinstance(payload, dict) and "code" in payload and _int_or_zero(payload["code"]) < 0
+            )
+            if not failed:
+                return payload
 
-        return payload
+            is_timestamp_error = isinstance(payload, dict) and _int_or_zero(payload.get("code")) == -1021
+            if is_timestamp_error and attempt + 1 < attempts:
+                logger.warning("Binance rejected request timestamp (-1021); re-syncing clock and retrying.")
+                await self.sync_server_time(market_type)
+                continue
+
+            self._raise_mapped_error(
+                response.status_code,
+                payload,
+                retry_after_header=response.headers.get("Retry-After"),
+            )
+
+        raise AssertionError("unreachable")
 
     async def load_markets(
         self, market_type: MarketType, force_refresh: bool = False
@@ -425,7 +496,7 @@ class BinanceAdapter(IExchangeAdapter):
             weight=2.0,
         )
         bars: list[CandleBar] = []
-        now_ms = self._time_ms_fn()
+        now_ms = self._server_time_ms()
         for row in rows:
             open_ms = int(row[0])
             close_ms = int(row[6]) if len(row) > 6 else open_ms
@@ -673,19 +744,13 @@ class BinanceAdapter(IExchangeAdapter):
         limit_price: Decimal | None = None,
     ) -> NormalizedOrderResponse:
         if market_type == MarketType.FUTURES_USDT:
-            req = NormalizedOrderRequest(
-                client_order_id=client_order_id,
+            return await self._place_futures_algo_stop(
                 symbol=symbol,
-                market_type=MarketType.FUTURES_USDT,
                 side=side,
-                order_type=OrderType.STOP_MARKET,
-                purpose=OrderPurpose.HARD_STOP_LOSS,
                 quantity=quantity,
                 stop_price=stop_price,
-                reduce_only=True,
-                working_type="MARK_PRICE",
+                client_order_id=client_order_id,
             )
-            return await self.place_order(req)
 
         # Spot market: place STOP_LOSS_LIMIT with a 0.3% aggressive limit buffer if limit_price not specified
         if limit_price is None:
@@ -719,10 +784,10 @@ class BinanceAdapter(IExchangeAdapter):
         new_client_order_id: str,
     ) -> NormalizedOrderResponse:
         try:
-            await self.cancel_order(
-                exchange_order_id=existing_order_id,
+            await self.cancel_stop_order(
                 symbol=symbol,
                 market_type=market_type,
+                exchange_order_id=existing_order_id,
                 client_order_id=existing_client_order_id,
             )
         except OrderNotFoundError:
@@ -769,9 +834,178 @@ class BinanceAdapter(IExchangeAdapter):
             rate_limiter=self._rate_limiter,
             weight=1.0,
         )
+        if market_type == MarketType.FUTURES_USDT:
+            # Futures stop-losses live in the separate algo order book since Dec 2025.
+            await execute_with_retry(
+                lambda: self._request(
+                    "DELETE",
+                    MarketType.FUTURES_USDT,
+                    "/fapi/v1/algoOpenOrders",
+                    params={"symbol": exch_symbol},
+                    signed=True,
+                ),
+                rate_limiter=self._rate_limiter,
+                weight=1.0,
+            )
         if isinstance(res, list):
             return len(res)
         return 1
+
+    # ------------------------------------------------------------------
+    # USDT-M futures conditional (algo) orders
+    #
+    # Since December 2025 Binance rejects STOP_MARKET / TAKE_PROFIT_MARKET on
+    # /fapi/v1/order (error -4120). Conditional orders must be sent to the Algo
+    # Order API, which has its own ids (algoId / clientAlgoId) and its own
+    # open-order book.
+    # ------------------------------------------------------------------
+
+    def _parse_algo_response(self, raw: dict[str, Any], symbol: str) -> NormalizedOrderResponse:
+        algo_status = str(raw.get("algoStatus", "NEW")).upper()
+        actual_order_id = str(raw.get("actualOrderId") or "")
+        if algo_status in _ALGO_TERMINAL_STATUS:
+            status = _ALGO_TERMINAL_STATUS[algo_status]
+        elif actual_order_id:
+            # Triggered: the stop became a real market order. Its fill state is read separately.
+            status = OrderStatus.SUBMITTED
+        else:
+            status = OrderStatus.OPEN
+
+        trigger = to_decimal(raw.get("triggerPrice") or "0")
+        actual_price = to_decimal(raw.get("actualPrice") or "0")
+        actual_qty = to_decimal(raw.get("actualQty") or "0")
+        return NormalizedOrderResponse(
+            client_order_id=str(raw.get("clientAlgoId", "")),
+            exchange_order_id=str(raw.get("algoId", "")),
+            symbol=symbol,
+            market_type=MarketType.FUTURES_USDT,
+            side=OrderSide.BUY if str(raw.get("side", "BUY")).upper() == "BUY" else OrderSide.SELL,
+            order_type=_map_binance_order_type(str(raw.get("orderType") or raw.get("type") or "STOP_MARKET")),
+            status=status,
+            requested_qty=to_decimal(raw.get("quantity") or "0"),
+            filled_qty=actual_qty,
+            avg_fill_price=actual_price if actual_price > Decimal("0") else None,
+            stop_price=trigger if trigger > Decimal("0") else None,
+            reduce_only=bool(raw.get("reduceOnly", False)),
+            raw_response=raw,
+        )
+
+    async def _place_futures_algo_stop(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: Decimal,
+        stop_price: Decimal,
+        client_order_id: str,
+    ) -> NormalizedOrderResponse:
+        if not CLIENT_ORDER_ID_PATTERN.match(client_order_id):
+            raise ExchangeOrderRejectedError(
+                f"Invalid client_order_id '{client_order_id}'",
+                exchange_id=ExchangeId.BINANCE,
+            )
+        rules = await self.get_market_rules(symbol, MarketType.FUTURES_USDT)
+        q_qty = rules.format_quantity(quantity)
+        q_stop = rules.format_price(stop_price)
+        if q_qty < rules.min_qty:
+            raise ExchangeOrderRejectedError(
+                f"Quantized stop quantity {q_qty} is below minimum {rules.min_qty} for {symbol}",
+                exchange_id=ExchangeId.BINANCE,
+            )
+        params: dict[str, Any] = {
+            "algoType": "CONDITIONAL",
+            "symbol": rules.exchange_symbol,
+            "side": side.value,
+            "type": "STOP_MARKET",
+            "quantity": str(q_qty),
+            "triggerPrice": str(q_stop),
+            "workingType": "MARK_PRICE",
+            "reduceOnly": "true",
+            "clientAlgoId": client_order_id,
+        }
+
+        async def _submit() -> NormalizedOrderResponse:
+            raw = await self._request(
+                "POST", MarketType.FUTURES_USDT, "/fapi/v1/algoOrder", params=params, signed=True
+            )
+            return self._parse_algo_response(raw, symbol)
+
+        async def _query_existing() -> NormalizedOrderResponse:
+            raw = await self._request(
+                "GET",
+                MarketType.FUTURES_USDT,
+                "/fapi/v1/algoOrder",
+                params={"clientAlgoId": client_order_id},
+                signed=True,
+            )
+            return self._parse_algo_response(raw, symbol)
+
+        return await submit_order_idempotently(
+            submit_fn=_submit,
+            query_existing_fn=_query_existing,
+            rate_limiter=self._rate_limiter,
+            weight=1.0,
+        )
+
+    async def cancel_stop_order(
+        self,
+        symbol: str,
+        market_type: MarketType,
+        exchange_order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> bool:
+        if market_type != MarketType.FUTURES_USDT:
+            return await self.cancel_order(
+                exchange_order_id=exchange_order_id or "",
+                symbol=symbol,
+                market_type=market_type,
+                client_order_id=client_order_id,
+            )
+        params: dict[str, Any] = {}
+        if exchange_order_id:
+            params["algoId"] = exchange_order_id
+        elif client_order_id:
+            params["clientAlgoId"] = client_order_id
+        else:
+            raise ValueError("Either exchange_order_id or client_order_id must be provided")
+        await execute_with_retry(
+            lambda: self._request(
+                "DELETE", MarketType.FUTURES_USDT, "/fapi/v1/algoOrder", params=params, signed=True
+            ),
+            rate_limiter=self._rate_limiter,
+            weight=1.0,
+        )
+        return True
+
+    async def fetch_stop_order(
+        self,
+        symbol: str,
+        market_type: MarketType,
+        client_order_id: str,
+    ) -> NormalizedOrderResponse:
+        if market_type != MarketType.FUTURES_USDT:
+            return await self.fetch_order(
+                symbol=symbol, market_type=market_type, client_order_id=client_order_id
+            )
+        raw = await execute_with_retry(
+            lambda: self._request(
+                "GET",
+                MarketType.FUTURES_USDT,
+                "/fapi/v1/algoOrder",
+                params={"clientAlgoId": client_order_id},
+                signed=True,
+            ),
+            rate_limiter=self._rate_limiter,
+            weight=1.0,
+        )
+        algo = self._parse_algo_response(raw, symbol)
+        actual_order_id = str(raw.get("actualOrderId") or "")
+        if not actual_order_id:
+            return algo
+        # The stop fired: report the resulting market order's real fill.
+        fill = await self.fetch_order(
+            symbol=symbol, market_type=MarketType.FUTURES_USDT, exchange_order_id=actual_order_id
+        )
+        return fill.model_copy(update={"client_order_id": client_order_id})
 
     async def fetch_order(
         self,
@@ -813,6 +1047,23 @@ class BinanceAdapter(IExchangeAdapter):
         for row in rows:
             sym = symbol or str(row.get("symbol", ""))
             results.append(self._parse_order_response(row, sym, market_type))
+
+        if market_type == MarketType.FUTURES_USDT:
+            # Stop-losses are algo orders and do not appear in /fapi/v1/openOrders. Without them
+            # the reconciler would think every position is unprotected and stack duplicate stops.
+            algo_rows = await execute_with_retry(
+                lambda: self._request(
+                    "GET", MarketType.FUTURES_USDT, "/fapi/v1/openAlgoOrders", params=params, signed=True
+                ),
+                rate_limiter=self._rate_limiter,
+                weight=1.0 if symbol else 40.0,
+            )
+            if isinstance(algo_rows, dict):
+                algo_rows = algo_rows.get("orders", [])
+            for row in algo_rows or []:
+                raw_sym = str(row.get("symbol", ""))
+                sym = symbol or (f"{raw_sym[:-4]}/USDT" if raw_sym.endswith("USDT") else raw_sym)
+                results.append(self._parse_algo_response(row, sym))
         return results
 
     async def fetch_open_positions(

@@ -378,3 +378,33 @@ class IExchangeAdapter(ABC):
     @abstractmethod
     async def close(self) -> None:
         """Release underlying HTTP clients and resources."""
+
+    async def sync_server_time(self, market_type: MarketType = MarketType.FUTURES_USDT) -> int:
+        """Align request timestamps with the exchange clock. Returns the offset in ms."""
+        return 0
+
+    async def cancel_stop_order(
+        self,
+        symbol: str,
+        market_type: MarketType,
+        exchange_order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> bool:
+        """Cancel a Tier-1 stop-loss. Exchanges that keep stops in a separate book override this."""
+        return await self.cancel_order(
+            exchange_order_id=exchange_order_id or "",
+            symbol=symbol,
+            market_type=market_type,
+            client_order_id=client_order_id,
+        )
+
+    async def fetch_stop_order(
+        self,
+        symbol: str,
+        market_type: MarketType,
+        client_order_id: str,
+    ) -> NormalizedOrderResponse:
+        """Fetch a Tier-1 stop-loss's state. FILLED means the stop fired and closed the position."""
+        return await self.fetch_order(
+            symbol=symbol, market_type=market_type, client_order_id=client_order_id
+        )

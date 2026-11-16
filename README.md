@@ -108,3 +108,12 @@ The Web Dashboard is served on port 80 at `http://localhost` (or `http://<your-v
    - Max 5.0% daily drawdown threshold.
    - One-Way Mode & Isolated Margin defaults.
    - 1-click Emergency Kill Switch.
+
+## ⚡ Live Execution
+- **Turning it on**: set a strategy's `execution_mode` to `LIVE` and its `exchange_connection_id` to an enabled exchange connection. Every other strategy keeps paper trading.
+- **When strategies run**: on Binance's kline WebSocket, the moment a candle closes. A 15s housekeeping loop also refreshes strategies and polls any symbol whose stream is stale over REST. Set `MARKET_STREAM_ENABLED=false` to use polling only.
+- **Entry flow**: risk gatekeeper → size from `min(balance, connection capital cap)` → futures symbol set to isolated margin with `risk_config.leverage` (default 1x) → market order → exchange-side stop. If the stop cannot be placed, the position is closed at once.
+- **Futures stops**: placed through Binance's Algo Order API (`/fapi/v1/algoOrder`). Binance has rejected `STOP_MARKET` on `/fapi/v1/order` since December 2025.
+- **Stop fills**: checked every housekeeping cycle. A filled exchange stop closes the position in the database. A stop that disappears raises a `STOP_LOSS_MISSING` alert.
+- **Clock**: request timestamps are corrected by Binance's server time. A `-1021` rejection re-syncs the clock and retries once.
+- **Not supported live yet**: Smart DCA safety scale-ins (they are skipped).

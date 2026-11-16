@@ -249,25 +249,34 @@ async def test_binance_adapter_markets_balance_futures_setup_and_orders() -> Non
             return httpx.Response(200, json={"symbol": "BTCUSDT", "leverage": 10})
 
         # 4. Order Placement (Spot & Futures)
+        # Since Dec 2025 futures conditional orders go to the Algo Order API.
+        if path == "/fapi/v1/algoOrder" and request.method == "POST":
+            assert qs["algoType"][0] == "CONDITIONAL"
+            assert qs["type"][0] == "STOP_MARKET"
+            assert qs["reduceOnly"][0] == "true"
+            assert qs["workingType"][0] == "MARK_PRICE"
+            return httpx.Response(
+                200,
+                json={
+                    "algoId": 50002,
+                    "clientAlgoId": qs["clientAlgoId"][0],
+                    "algoType": "CONDITIONAL",
+                    "orderType": "STOP_MARKET",
+                    "symbol": "BTCUSDT",
+                    "side": qs["side"][0],
+                    "quantity": qs["quantity"][0],
+                    "algoStatus": "NEW",
+                    "triggerPrice": qs["triggerPrice"][0],
+                    "reduceOnly": True,
+                },
+            )
+
         if path == "/fapi/v1/order" and request.method == "POST":
             otype = qs["type"][0]
-            if otype == "STOP_MARKET":
-                assert qs["reduceOnly"][0] == "true"
-                assert qs["workingType"][0] == "MARK_PRICE"
+            if otype in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
                 return httpx.Response(
-                    200,
-                    json={
-                        "orderId": 50002,
-                        "clientOrderId": qs["newClientOrderId"][0],
-                        "symbol": "BTCUSDT",
-                        "side": qs["side"][0],
-                        "type": "STOP_MARKET",
-                        "status": "NEW",
-                        "origQty": qs["quantity"][0],
-                        "executedQty": "0.000",
-                        "stopPrice": qs["stopPrice"][0],
-                        "reduceOnly": True,
-                    },
+                    400,
+                    json={"code": -4120, "msg": "Order type not supported for this endpoint. Please use the Algo Order API endpoints instead."},
                 )
             return httpx.Response(
                 200,
@@ -377,6 +386,9 @@ async def test_binance_adapter_markets_balance_futures_setup_and_orders() -> Non
     assert sl_resp.order_type == OrderType.STOP_MARKET
     assert sl_resp.stop_price == Decimal("63700.10")
     assert sl_resp.reduce_only is True
+    assert sl_resp.exchange_order_id == "50002"
+    assert sl_resp.client_order_id == "T_SL_BTC_1001"
+    assert sl_resp.status == OrderStatus.OPEN
 
     # 6. Place Tier-1 Hard Stop-Loss on Spot (STOP_LOSS_LIMIT with 0.3% buffer)
     spot_sl = await adapter.place_hard_stop_loss(
