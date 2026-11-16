@@ -103,12 +103,13 @@ export const api = {
   async runBacktest(
     strategyId: string,
     symbol: string = 'BTC/USDT',
-    lookbackDays: number = 30
+    lookbackDays?: number
   ): Promise<any> {
     const res = await fetch(`${API_BASE}/strategies/${strategyId}/backtest`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbol, lookback_days: lookbackDays }),
+      // Without lookbackDays the backend picks a window that suits the strategy's timeframe.
+      body: JSON.stringify(lookbackDays ? { symbol, lookback_days: lookbackDays } : { symbol }),
     });
     return handleResponse(res);
   },

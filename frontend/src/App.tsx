@@ -198,7 +198,7 @@ export const App: React.FC = () => {
   const handleRunBacktest = async (strategyId: string) => {
     try {
       setBacktestResult(null);
-      const res = await api.runBacktest(strategyId, symbol, 30);
+      const res = await api.runBacktest(strategyId, symbol);
       setBacktestResult(res);
     } catch (err: any) {
       alert(`Backtest error: ${err.message}`);

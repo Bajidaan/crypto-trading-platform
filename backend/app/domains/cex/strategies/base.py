@@ -13,7 +13,7 @@ from app.core.events import (
 )
 from app.domains.cex.adapters.base import TickerSnapshot
 from app.domains.cex.market_data.buffer import CandleBuffer
-from app.models.enums import MarketType, PositionSide, SignalSource
+from app.models.enums import MarketType, PositionSide, SignalAction, SignalSource
 
 
 class IStrategy(ABC):
@@ -36,6 +36,21 @@ class IStrategy(ABC):
         self.timeframe = timeframe
         self.parameters = parameters or {}
         self.risk_config = risk_config or {}
+
+        # Set by the host (runner or backtester) before each on_candle call: the side of this
+        # strategy's open position per symbol. A symbol with no open position is absent.
+        self.position_state: dict[str, PositionSide] = {}
+        # Set by the host: candle buffers for every symbol listed in `context_symbols`.
+        self.context_buffers: dict[str, CandleBuffer] = {}
+
+    @property
+    def context_symbols(self) -> list[str]:
+        """Extra symbols (e.g. a benchmark) whose candles the host must supply in `context_buffers`."""
+        return []
+
+    def current_side(self, symbol: str) -> PositionSide | None:
+        """Side of this strategy's open position on `symbol`, or None when flat."""
+        return self.position_state.get(symbol)
 
     @property
     @abstractmethod
@@ -71,6 +86,7 @@ class IStrategy(ABC):
         take_profit_targets: list[TakeProfitTargetSpec] | None = None,
         metadata: dict[str, Any] | None = None,
         source: SignalSource = SignalSource.STRATEGY,
+        target_weight: Decimal | None = None,
     ) -> TradeSignalEvent:
         """Construct a standardized TradeSignalEvent bound to this strategy."""
         return TradeSignalEvent(
@@ -79,9 +95,34 @@ class IStrategy(ABC):
             symbol=symbol,
             market_type=self.market_type,
             side=side,
+            target_weight=target_weight,
             signal_price=signal_price,
             stop_loss_price=stop_loss_price,
             take_profit_targets=take_profit_targets or [],
+            metadata={
+                "strategy_name": self.name,
+                "timeframe": self.timeframe,
+                **(metadata or {}),
+            },
+        )
+
+    def create_exit_signal(
+        self,
+        symbol: str,
+        side: PositionSide,
+        signal_price: Decimal,
+        metadata: dict[str, Any] | None = None,
+    ) -> TradeSignalEvent:
+        """Construct a signal asking the host to close this strategy's open `side` position."""
+        return TradeSignalEvent(
+            strategy_id=self.strategy_id,
+            source=SignalSource.STRATEGY,
+            symbol=symbol,
+            market_type=self.market_type,
+            side=side,
+            action=SignalAction.EXIT,
+            signal_price=signal_price,
+            stop_loss_price=signal_price,
             metadata={
                 "strategy_name": self.name,
                 "timeframe": self.timeframe,

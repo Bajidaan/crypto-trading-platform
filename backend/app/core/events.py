@@ -18,6 +18,7 @@ from app.models.enums import (
     OrderStatus,
     PositionSide,
     PositionStatus,
+    SignalAction,
     SignalSource,
 )
 
@@ -58,7 +59,7 @@ class TakeProfitTargetSpec(BaseModel):
 
     target_index: int = Field(ge=1)
     price: Decimal
-    close_Dynamic_pct: Decimal = Field(
+    close_dynamic_pct: Decimal = Field(
         default=Decimal("100"),
         ge=Decimal("1"),
         le=Decimal("100"),
@@ -78,6 +79,11 @@ class TradeSignalEvent(DomainEvent):
     execution_mode: ExecutionMode = ExecutionMode.PAPER
     symbol: str
     side: PositionSide
+    # ENTRY opens a position on `side`; EXIT closes the strategy's open position on `side`.
+    action: SignalAction = SignalAction.ENTRY
+    # Optional notional size as a fraction of equity (0.25 = 25%). When set, it replaces
+    # stop-distance risk sizing.
+    target_weight: Decimal | None = None
     signal_price: Decimal = Decimal("0")
     entry_price: Decimal | None = None  # None implies Market entry at current price
     stop_loss_price: Decimal

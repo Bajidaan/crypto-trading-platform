@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_adapter_factory, get_db_session
 from app.domains.cex.adapters.factory import ExchangeAdapterFactory
-from app.domains.cex.backtesting import DeterministicBacktestEngine
+from app.domains.cex.backtesting import DeterministicBacktestEngine, fetch_ohlcv_history
+from app.domains.cex.market_data.buffer import timeframe_to_seconds
 from app.domains.cex.strategies.registry import StrategyRegistry
 from app.models.entities import BacktestRun, ExchangeConnection, StrategyConfig
 from app.models.enums import ExecutionMode, MarketType
@@ -43,10 +44,19 @@ class UpdateStrategyRequest(BaseModel):
 
 class RunBacktestRequest(BaseModel):
     symbol: str = "BTC/USDT"
-    timeframe: str = "15m"
-    candle_limit: int = 500
+    # Defaults to the strategy's own timeframe.
+    timeframe: str | None = None
+    # Length of the tested window: give one of these, or neither for a default
+    # (1500 bars on 4h-or-longer timeframes, 500 bars otherwise). The strategy's warmup
+    # bars are fetched in addition, so the whole window is tradable.
+    lookback_days: int | None = Field(default=None, ge=1)
+    candle_limit: int | None = Field(default=None, ge=10)
     initial_capital: float = 10000.0
     risk_per_trade_pct: float = 1.0
+    # Per-side costs in percent. cost_multiplier scales both, e.g. 2.0 for a stress test.
+    taker_fee_pct: float = Field(default=0.05, ge=0)
+    slippage_pct: float = Field(default=0.05, ge=0)
+    cost_multiplier: float = Field(default=1.0, ge=0)
 
 
 @router.get("/available-classes")
@@ -200,26 +210,42 @@ async def run_strategy_backtest(
         from app.domains.cex.adapters.binance import BinanceAdapter
         adapter = BinanceAdapter(api_key="", api_secret="", is_testnet=False)
 
+    timeframe = req.timeframe or strat_cfg.timeframe or "15m"
+    strategy_instance.timeframe = timeframe
+    tf_seconds = timeframe_to_seconds(timeframe)
+    if req.lookback_days is not None:
+        window_bars = max(10, req.lookback_days * 86400 // tf_seconds)
+    elif req.candle_limit is not None:
+        window_bars = req.candle_limit
+    else:
+        window_bars = 1500 if tf_seconds >= 4 * 3600 else 500
+    total_bars = window_bars + strategy_instance.required_warmup_bars
+
+    context_candles: dict[str, list[Any]] = {}
     try:
         m_type = MarketType(strat_cfg.market_type)
-        candles = await adapter.fetch_ohlcv(
-            symbol=req.symbol,
-            market_type=m_type,
-            timeframe=req.timeframe,
-            limit=req.candle_limit,
-        )
+        candles = await fetch_ohlcv_history(adapter, req.symbol, m_type, timeframe, total_bars)
+        for ctx_symbol in strategy_instance.context_symbols:
+            if ctx_symbol != req.symbol:
+                context_candles[ctx_symbol] = await fetch_ohlcv_history(
+                    adapter, ctx_symbol, m_type, timeframe, total_bars
+                )
     finally:
         await adapter.close()
 
     if not candles:
         raise HTTPException(status_code=400, detail="Failed to retrieve historical candle data.")
 
+    cost_scale = Decimal(str(req.cost_multiplier)) / Decimal("100")
     engine = DeterministicBacktestEngine(
         strategy=strategy_instance,
         initial_capital=Decimal(str(req.initial_capital)),
         risk_per_trade_pct=Decimal(str(req.risk_per_trade_pct)),
+        taker_fee=Decimal(str(req.taker_fee_pct)) * cost_scale,
+        slippage_pct=Decimal(str(req.slippage_pct)) * cost_scale,
     )
-    result = engine.run(candles)
+    result = engine.run(candles, context_candles=context_candles)
+    comparison = result.comparison.model_dump(mode="json") if result.comparison else {}
 
     metrics_dict = result.metrics.model_dump(mode="json")
     trades_sanitized = [
@@ -234,12 +260,12 @@ async def run_strategy_backtest(
         exchange_id="BINANCE",
         symbol=req.symbol,
         market_type=strat_cfg.market_type,
-        timeframe=req.timeframe,
+        timeframe=timeframe,
         start_date=candles[0].open_time,
         end_date=candles[-1].open_time,
         initial_capital_usd=result.metrics.initial_capital,
         parameters=strat_cfg.parameters,
-        metrics=metrics_dict,
+        metrics={**metrics_dict, "comparison": comparison},
         equity_curve=[{"index": i, "equity": float(x)} for i, x in enumerate(result.equity_curve)],
         trades_log=trades_sanitized,
     )
@@ -253,7 +279,11 @@ async def run_strategy_backtest(
         "total_return_pct": float(metrics_dict.get("total_return_pct", 0.0)),
         "win_rate_pct": float(metrics_dict.get("win_rate_pct", 0.0)),
         "profit_factor": float(metrics_dict.get("profit_factor", 0.0)),
-        "max_drawdown_pct": float(metrics_dict.get("max_drawdown_pct", 0.0)),
+        # Drawdown is marked to market at every bar, so open-trade losses are included.
+        "max_drawdown_pct": float(comparison.get("strategy_max_drawdown_pct", 0.0)),
+        "timeframe": timeframe,
+        "bars": len(candles),
+        "comparison": comparison,
         "metrics": metrics_dict,
         "trades_count": len(result.trades),
         "equity_curve": [float(x) for x in result.equity_curve],

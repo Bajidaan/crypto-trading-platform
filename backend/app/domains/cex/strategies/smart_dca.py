@@ -93,7 +93,7 @@ class SmartDcaScaleInStrategy(IStrategy):
                     TakeProfitTargetSpec(
                         target_index=1,
                         price=tp_price,
-                        close_Dynamic_pct=Decimal("100"),
+                        close_dynamic_pct=Decimal("100"),
                         move_sl_to_breakeven=False,
                     )
                 ]
@@ -149,7 +149,7 @@ class SmartDcaScaleInStrategy(IStrategy):
                         TakeProfitTargetSpec(
                             target_index=1,
                             price=tp_price,
-                            close_Dynamic_pct=Decimal("100"),
+                            close_dynamic_pct=Decimal("100"),
                         )
                     ],
                     metadata={

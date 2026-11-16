@@ -43,6 +43,19 @@ const STRATEGY_DEFAULTS: Record<string, Record<string, number>> = {
     atr_sl_multiplier: 1.5,
     tp_r_multiplier: 2.5,
   },
+  vol_trend: {
+    fast_ma_period: 10,
+    slow_ma_period: 30,
+    regime_ma_period: 200,
+    use_regime_filter: 1,
+    band_pct: 1.0,
+    vol_lookback: 30,
+    target_annual_vol_pct: 25,
+    max_weight_pct: 100,
+    atr_period: 14,
+    atr_stop_multiplier: 4.0,
+    allow_short: 0,
+  },
   bollinger_breakout: {
     bb_period: 20,
     bb_std: 2,
@@ -372,6 +385,20 @@ export const StrategyPanel: React.FC<StrategyPanelProps> = ({
               </div>
             </div>
           </div>
+
+          {backtestResult.comparison?.buy_and_hold_return_pct !== undefined && (
+            <div className="mt-2 text-[10px] font-mono text-gray-400 flex flex-wrap gap-x-4 gap-y-1">
+              <span>
+                Buy &amp; hold: {Number(backtestResult.comparison.buy_and_hold_return_pct).toFixed(2)}% return,{' '}
+                {Number(backtestResult.comparison.buy_and_hold_max_drawdown_pct).toFixed(2)}% max drawdown
+              </span>
+              <span>In market: {Number(backtestResult.comparison.time_in_market_pct).toFixed(0)}% of bars</span>
+              <span>Fees: ${Number(backtestResult.comparison.total_fees_paid).toFixed(2)}</span>
+              <span>
+                {backtestResult.bars} × {backtestResult.timeframe} bars
+              </span>
+            </div>
+          )}
         </div>
       )}
     </div>

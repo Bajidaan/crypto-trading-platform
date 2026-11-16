@@ -6,6 +6,7 @@ from app.domains.cex.strategies.base import IStrategy
 from app.domains.cex.strategies.bb_breakout import BollingerAdxBreakoutStrategy
 from app.domains.cex.strategies.ema_rsi_atr import EmaRsiAtrTrendStrategy
 from app.domains.cex.strategies.smart_dca import SmartDcaScaleInStrategy
+from app.domains.cex.strategies.vol_trend import VolScaledTrendStrategy
 from app.models.entities import StrategyConfig
 from app.models.enums import MarketType
 
@@ -18,6 +19,7 @@ class StrategyRegistry:
         "bb_breakout": BollingerAdxBreakoutStrategy,
         "bollinger_breakout": BollingerAdxBreakoutStrategy,
         "smart_dca": SmartDcaScaleInStrategy,
+        "vol_trend": VolScaledTrendStrategy,
     }
 
     @classmethod

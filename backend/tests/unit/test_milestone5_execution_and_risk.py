@@ -366,7 +366,7 @@ async def test_paper_trading_broker_simulation() -> None:
     tp_target = TakeProfitTargetSpec(
         target_index=1,
         price=Decimal("68000.00"),
-        close_Dynamic_pct=Decimal("100"),
+        close_dynamic_pct=Decimal("100"),
     )
 
     # 1. Submit Market Entry Order
@@ -419,7 +419,7 @@ async def test_hybrid_sl_tp_manager_airbag_and_breakeven() -> None:
     tp1 = TakeProfitTargetSpec(
         target_index=1,
         price=Decimal("67000.00"),
-        close_Dynamic_pct=Decimal("50"),
+        close_dynamic_pct=Decimal("50"),
         move_sl_to_breakeven=True,
     )
 

@@ -35,6 +35,8 @@ from app.models.enums import (
     OrderStatus,
     OrderType,
     PositionSide,
+    PositionStatus,
+    SignalAction,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +95,6 @@ class ContinuousStrategyRunner:
 
     async def _handle_position_closed(self, event: PositionUpdatedEvent) -> None:
         """Notify strategy instances when a position is closed so stateful strategies (e.g. Smart DCA) reset."""
-        from app.models.enums import PositionStatus
         if event.status == PositionStatus.CLOSED:
             for strat in self._active_strategy_instances.values():
                 if hasattr(strat, "on_position_event"):
@@ -102,16 +103,62 @@ class ContinuousStrategyRunner:
                     except Exception as exc:
                         logger.debug("Strategy on_position_event callback error: %s", exc)
 
-    def _get_buffer(self, symbol: str, timeframe: str, market_type: MarketType) -> CandleBuffer:
+    def _get_buffer(
+        self,
+        symbol: str,
+        timeframe: str,
+        market_type: MarketType,
+        min_size: int = 300,
+    ) -> CandleBuffer:
         key = (symbol, timeframe, market_type.value)
-        if key not in self._buffers:
-            self._buffers[key] = CandleBuffer(
+        existing = self._buffers.get(key)
+        if existing is None or existing.max_size < min_size:
+            grown = CandleBuffer(
                 symbol=symbol,
                 timeframe=timeframe,
                 market_type=market_type,
-                max_size=300,
+                max_size=max(300, min_size),
             )
+            if existing is not None:
+                grown.load_history(existing.candles)
+            self._buffers[key] = grown
         return self._buffers[key]
+
+    async def _load_context_buffers(
+        self,
+        strat: IStrategy,
+        symbol: str,
+        symbol_buffer: CandleBuffer,
+        timeframe: str,
+        market_type: MarketType,
+        limit: int,
+    ) -> bool:
+        """Give the strategy fresh candles for its context symbols (e.g. a benchmark).
+
+        Returns False when a context symbol could not be loaded, so the caller can retry later
+        instead of evaluating the strategy on missing data.
+        """
+        for ctx_symbol in strat.context_symbols:
+            if ctx_symbol == symbol:
+                strat.context_buffers[ctx_symbol] = symbol_buffer
+                continue
+            ctx_buffer = self._get_buffer(ctx_symbol, timeframe, market_type, limit + 50)
+            try:
+                ctx_candles = await self._default_adapter.fetch_ohlcv(  # type: ignore[union-attr]
+                    symbol=ctx_symbol,
+                    market_type=market_type,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+            except Exception as err:
+                logger.warning("Failed to fetch context candles for %s: %s", ctx_symbol, err)
+                return False
+            if not ctx_candles:
+                return False
+            for c in ctx_candles:
+                ctx_buffer.update_or_append(c)
+            strat.context_buffers[ctx_symbol] = ctx_buffer
+        return True
 
     async def _run_loop(self) -> None:
         """Periodic evaluation loop."""
@@ -176,10 +223,9 @@ class ContinuousStrategyRunner:
         if not adapter:
             return
 
-        buffer = self._get_buffer(symbol, timeframe, market_type)
-
         # 1. Fetch recent candles from exchange (50 bars for indicator warmup)
         limit = max(50, strat.required_warmup_bars + 10)
+        buffer = self._get_buffer(symbol, timeframe, market_type, limit + 50)
         try:
             candles = await adapter.fetch_ohlcv(
                 symbol=symbol,
@@ -234,6 +280,15 @@ class ContinuousStrategyRunner:
         if bar_key in self._evaluated_bars:
             return
 
+        # Tell the strategy what it holds and hand it its benchmark candles before evaluating.
+        if not await self._load_context_buffers(strat, symbol, buffer, timeframe, market_type, limit):
+            return  # retry on the next poll rather than skip this bar
+        strat.position_state = {
+            p.symbol: p.side
+            for p in self.paper_broker.positions
+            if p.strategy_id == cfg.id and p.status == PositionStatus.OPEN
+        }
+
         signals = strat.on_candle(closed_candle, buffer)
         self._evaluated_bars.add(bar_key)
         if len(self._evaluated_bars) > 1000:
@@ -246,7 +301,8 @@ class ContinuousStrategyRunner:
 
         # 5. Process signals
         for sig in signals:
-            await self._process_signal(sig, cfg, closed_candle.close)
+            # Orders fill at the live price (last trade of the bar in progress), not the old close.
+            await self._process_signal(sig, cfg, latest_candle.close)
 
     async def _process_signal(
         self,
@@ -255,6 +311,28 @@ class ContinuousStrategyRunner:
         current_price: Decimal,
     ) -> None:
         """Run signal through Risk Gatekeeper and execute paper/live trade."""
+        # 0. Strategy-driven exit: close this strategy's open position on the symbol.
+        if sig.action == SignalAction.EXIT:
+            for pos in self.paper_broker.positions:
+                if (
+                    pos.strategy_id == sig.strategy_id
+                    and pos.symbol == sig.symbol
+                    and pos.side == sig.side
+                    and pos.status == PositionStatus.OPEN
+                ):
+                    logger.info(
+                        "ContinuousStrategyRunner closing paper position %s on %s (strategy exit: %s)",
+                        pos.position_id[:8],
+                        sig.symbol,
+                        sig.metadata.get("exit_trigger", "STRATEGY_EXIT"),
+                    )
+                    await self.paper_broker.close_position_market(
+                        pos.position_id,
+                        exit_price=current_price,
+                        exit_reason="STRATEGY_EXIT",
+                    )
+            return
+
         # 1. Gather all active positions from broker AND database for 100% accurate concentration checks
         active_positions = list(self.paper_broker.positions)
         if self.session_factory:
@@ -262,7 +340,6 @@ class ContinuousStrategyRunner:
                 async with self.session_factory() as session:
                     from sqlalchemy import select
                     from app.models.entities import Position
-                    from app.models.enums import PositionStatus
                     stmt = select(Position).where(Position.status == PositionStatus.OPEN.value)
                     db_open = (await session.execute(stmt)).scalars().all()
                     known_ids = {p.position_id for p in active_positions if hasattr(p, "position_id")}
@@ -291,7 +368,18 @@ class ContinuousStrategyRunner:
         base_size_usd = cfg.parameters.get("base_order_size_usd") if cfg.parameters else None
         is_dca_scale_in = isinstance(sig.metadata, dict) and sig.metadata.get("dca_order_type") == "SAFETY_SCALE_IN"
 
-        if base_size_usd:
+        risk_cfg = cfg.risk_config or {}
+        if sig.target_weight is not None:
+            # Volatility-targeted sizing: notional is a fraction of equity chosen by the strategy.
+            # The notional cap applies only when the strategy's risk_config sets one explicitly.
+            order_usd = self.paper_broker.total_equity * sig.target_weight
+            if "max_notional_usd" in risk_cfg:
+                order_usd = min(order_usd, max_notional_usd)
+            qty = to_decimal(round(float(order_usd / current_price), 4))
+            if qty <= Decimal("0"):
+                logger.warning("Target-weight position size rounds to zero for %s", sig.symbol)
+                return
+        elif base_size_usd:
             order_usd = to_decimal(base_size_usd)
             if is_dca_scale_in:
                 step_num = int(sig.metadata.get("safety_step", 1))
@@ -419,7 +507,7 @@ class ContinuousStrategyRunner:
                         market_type=sig.market_type.value,
                         side=sig.side.value,
                         margin_mode="ISOLATED",
-                        leverage=1 if base_size_usd else 2,
+                        leverage=1 if (base_size_usd or sig.target_weight is not None) else 2,
                         entry_price=fill_price,
                         initial_qty=qty,
                         current_qty=qty,

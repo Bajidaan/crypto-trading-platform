@@ -92,7 +92,7 @@ class WebhookSignalReceiver:
                 TakeProfitTargetSpec(
                     target_index=1,
                     price=model.take_profit_1,
-                    close_Dynamic_pct=Decimal("50") if model.take_profit_2 else Decimal("100"),
+                    close_dynamic_pct=Decimal("50") if model.take_profit_2 else Decimal("100"),
                     move_sl_to_breakeven=True,
                 )
             )
@@ -101,7 +101,7 @@ class WebhookSignalReceiver:
                 TakeProfitTargetSpec(
                     target_index=2,
                     price=model.take_profit_2,
-                    close_Dynamic_pct=Decimal("50"),
+                    close_dynamic_pct=Decimal("50"),
                     move_sl_to_breakeven=False,
                 )
             )

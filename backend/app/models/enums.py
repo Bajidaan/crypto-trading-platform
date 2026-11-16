@@ -103,6 +103,13 @@ class SignalSource(StrEnum):
     MANUAL = "MANUAL"
 
 
+class SignalAction(StrEnum):
+    """What a trade signal asks the engine to do."""
+
+    ENTRY = "ENTRY"
+    EXIT = "EXIT"
+
+
 class SignalStatus(StrEnum):
     """Lifecycle status of an emitted trade signal."""
 

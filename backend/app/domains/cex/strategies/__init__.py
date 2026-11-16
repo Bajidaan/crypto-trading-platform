@@ -12,6 +12,7 @@ from app.domains.cex.strategies.indicators import (
 )
 from app.domains.cex.strategies.registry import StrategyRegistry
 from app.domains.cex.strategies.smart_dca import SmartDcaScaleInStrategy
+from app.domains.cex.strategies.vol_trend import VolScaledTrendStrategy
 from app.domains.cex.strategies.webhook_receiver import (
     WebhookSignalPayload,
     WebhookSignalReceiver,
@@ -23,6 +24,7 @@ __all__ = [
     "IStrategy",
     "SmartDcaScaleInStrategy",
     "StrategyRegistry",
+    "VolScaledTrendStrategy",
     "WebhookSignalPayload",
     "WebhookSignalReceiver",
     "calculate_adx",

@@ -109,13 +109,13 @@ class EmaRsiAtrTrendStrategy(IStrategy):
                 TakeProfitTargetSpec(
                     target_index=1,
                     price=tp1,
-                    close_Dynamic_pct=Decimal("50"),
+                    close_dynamic_pct=Decimal("50"),
                     move_sl_to_breakeven=True,
                 ),
                 TakeProfitTargetSpec(
                     target_index=2,
                     price=tp2,
-                    close_Dynamic_pct=Decimal("50"),
+                    close_dynamic_pct=Decimal("50"),
                     move_sl_to_breakeven=False,
                 ),
             ]
@@ -155,13 +155,13 @@ class EmaRsiAtrTrendStrategy(IStrategy):
                 TakeProfitTargetSpec(
                     target_index=1,
                     price=tp1,
-                    close_Dynamic_pct=Decimal("50"),
+                    close_dynamic_pct=Decimal("50"),
                     move_sl_to_breakeven=True,
                 ),
                 TakeProfitTargetSpec(
                     target_index=2,
                     price=tp2,
-                    close_Dynamic_pct=Decimal("50"),
+                    close_dynamic_pct=Decimal("50"),
                     move_sl_to_breakeven=False,
                 ),
             ]
