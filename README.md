@@ -74,6 +74,13 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 The REST API will be available at `http://localhost:8000` with interactive OpenAPI documentation at `http://localhost:8000/docs`.
 
+**Database migrations** (Alembic, in `backend/migrations`) run automatically when the server starts. A database created before migrations existed is detected and upgraded in place. To run them by hand, or to add one after changing `app/models/entities.py`:
+```powershell
+python -m alembic upgrade head
+python -m alembic revision --autogenerate -m "describe the change"
+```
+Decimal columns use `ExactDecimal`: TEXT on SQLite (SQLite's NUMERIC is a binary float), NUMERIC on PostgreSQL. Do sums and comparisons on them in Python, not in SQL.
+
 ### 3. Frontend Setup & Run
 ```powershell
 cd E:\Codes\crypto_trading_platform\frontend

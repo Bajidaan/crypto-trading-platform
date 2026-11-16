@@ -97,6 +97,8 @@ class PaperTradingBroker:
         self._positions: dict[str, PaperPosition] = {}
         # Orders: order_id -> NormalizedOrderResponse
         self._orders: dict[str, NormalizedOrderResponse] = {}
+        # Open positions whose unrealized PnL changed since the last DB flush
+        self._dirty_marks: set[str] = set()
 
     @property
     def open_positions_count(self) -> int:
@@ -356,19 +358,9 @@ class PaperTradingBroker:
                 notional = pos.entry_price * pos.current_qty
                 pnl_pct = float(gross_unrealized / notional * 100 * pos.leverage) if notional > 0 else 0.0
 
-                if self._session_factory is not None:
-                    try:
-                        from sqlalchemy import select
-                        from app.models.entities import Position
-                        async with self._session_factory() as session:
-                            db_pos = (
-                                await session.execute(select(Position).where(Position.id == pos.position_id))
-                            ).scalar_one_or_none()
-                            if db_pos and db_pos.status == PositionStatus.OPEN.value:
-                                db_pos.unrealized_pnl_usd = gross_unrealized
-                                await session.commit()
-                    except Exception as db_err:
-                        logger.debug("Failed to update live unrealized PnL in DB: %s", db_err)
+                # Mark-to-market stays in memory; flush_marks_to_db() saves it in one batch.
+                # Writing per tick meant one blocking commit per position per price update.
+                self._dirty_marks.add(pos.position_id)
 
                 await self.event_bus.publish(
                     PositionUpdatedEvent(
@@ -391,6 +383,41 @@ class PaperTradingBroker:
 
         for pid in closed_position_ids:
             self._positions.pop(pid, None)
+            self._dirty_marks.discard(pid)
+
+    async def flush_marks_to_db(self) -> int:
+        """Save unrealized PnL of positions whose mark changed since the last flush.
+
+        Unrealized PnL is derived from the live price, so losing the last few seconds of it
+        in a crash costs nothing; the runner calls this once per housekeeping cycle.
+        """
+        if self._session_factory is None or not self._dirty_marks:
+            return 0
+        pending = {
+            pid: self._positions[pid].unrealized_pnl
+            for pid in self._dirty_marks
+            if pid in self._positions and self._positions[pid].status == PositionStatus.OPEN
+        }
+        self._dirty_marks.clear()
+        if not pending:
+            return 0
+        try:
+            from sqlalchemy import update
+            from app.models.entities import Position
+
+            async with self._session_factory() as session:
+                for pid, unrealized in pending.items():
+                    await session.execute(
+                        update(Position)
+                        .where(Position.id == pid, Position.status == PositionStatus.OPEN.value)
+                        .values(unrealized_pnl_usd=unrealized)
+                    )
+                await session.commit()
+        except Exception as db_err:
+            logger.debug("Failed to flush unrealized PnL to DB: %s", db_err)
+            self._dirty_marks.update(pending)
+            return 0
+        return len(pending)
 
     async def close_position_market(
         self,
@@ -444,7 +471,7 @@ class PaperTradingBroker:
             else (OrderPurpose.TAKE_PROFIT if "PROFIT" in exit_reason else OrderPurpose.MANUAL_CLOSE)
         )
         exit_order_id = str(uuid.uuid4())
-        exit_cid = f"exit-{pos.position_id[:8]}-{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        exit_cid = f"exit-{pos.position_id[:8]}-{uuid.uuid4().hex[:16]}"
 
         logger.info(
             "[PaperTradingBroker] Closed position %s (%s %s) via %s @ %s | Net PnL: $%.2f | Equity: $%.2f",

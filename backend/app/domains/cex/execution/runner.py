@@ -64,6 +64,10 @@ logger = logging.getLogger(__name__)
 # Live ticks arrive every ~250 ms per futures stream; dashboard updates, paper SL/TP checks
 # and Tier-2 checks are rate-limited to this interval per kline.
 TICK_THROTTLE_SEC = 1.0
+# A chart symbol keeps streaming this long after the dashboard last asked for it.
+CHART_WATCH_TTL_SEC = 600.0
+# Without a fresh stream, chart bars are refreshed over REST at most this often.
+CHART_REST_REFRESH_SEC = 5.0
 
 
 class ContinuousStrategyRunner:
@@ -106,6 +110,8 @@ class ContinuousStrategyRunner:
         self._owns_default_adapter = market_data_adapter is None
         self._stream: BinanceKlineStream | None = None
         self._last_tick_at: dict[KlineKey, float] = {}
+        self._chart_watch: dict[KlineKey, float] = {}
+        self._chart_rest_at: dict[KlineKey, float] = {}
 
         # Live trading state, per exchange connection id.
         self._live_adapters: dict[str, IExchangeAdapter] = {}
@@ -151,6 +157,10 @@ class ContinuousStrategyRunner:
             self._task = None
         for task in list(self._eval_tasks):
             task.cancel()
+        try:
+            await self.paper_broker.flush_marks_to_db()
+        except Exception as exc:
+            logger.warning("Final paper mark flush failed: %s", exc)
         if self._default_adapter and self._owns_default_adapter:
             await self._default_adapter.close()
             self._default_adapter = None
@@ -291,6 +301,13 @@ class ContinuousStrategyRunner:
                 logger.error("Live position sync failed: %s", exc, exc_info=True)
 
             try:
+                await self.paper_broker.flush_marks_to_db()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Paper mark flush failed: %s", exc)
+
+            try:
                 await asyncio.sleep(self.poll_interval)
             except asyncio.CancelledError:
                 break
@@ -308,17 +325,67 @@ class ContinuousStrategyRunner:
                 except Exception as exc:
                     logger.warning("Could not build strategy %s (%s): %s", cfg.name, cfg.id, exc)
         self._active_configs = [c for c in active_configs if c.id in self._active_strategy_instances]
-
-        if self._stream:
-            keys: set[KlineKey] = set()
-            for cfg in self._active_configs:
-                strat = self._active_strategy_instances[cfg.id]
-                mt = MarketType(cfg.market_type)
-                tf = cfg.timeframe or "15m"
-                for sym in list(cfg.symbols or ["BTC/USDT"]) + list(strat.context_symbols):
-                    keys.add((sym, tf, mt))
-            self._stream.set_subscriptions(keys)
+        self._update_stream_subscriptions()
         return self._active_configs
+
+    def _update_stream_subscriptions(self) -> None:
+        """Stream every kline a strategy needs plus every chart viewed in the last 10 minutes."""
+        if not self._stream:
+            return
+        keys: set[KlineKey] = set()
+        for cfg in self._active_configs:
+            strat = self._active_strategy_instances.get(cfg.id)
+            if strat is None:
+                continue
+            mt = MarketType(cfg.market_type)
+            tf = cfg.timeframe or "15m"
+            for sym in list(cfg.symbols or ["BTC/USDT"]) + list(strat.context_symbols):
+                keys.add((sym, tf, mt))
+        now = time.monotonic()
+        for key, seen in list(self._chart_watch.items()):
+            if now - seen > CHART_WATCH_TTL_SEC:
+                del self._chart_watch[key]
+            else:
+                keys.add(key)
+        self._stream.set_subscriptions(keys)
+
+    # ================================================================== dashboard chart
+
+    async def chart_candles(
+        self, symbol: str, timeframe: str, market_type: MarketType, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Candles for the dashboard chart, served from the runner's buffers.
+
+        History is fetched over REST once; after that the kline stream keeps the buffer live
+        (and pushes each update to the browser over the dashboard WebSocket), so repeated
+        chart polls cost no exchange request, TLS handshake or credential decryption. Without
+        a fresh stream the latest bars are refreshed over REST at most every few seconds,
+        shared by all open tabs.
+        """
+        limit = max(1, min(limit, 1000))
+        key: KlineKey = (symbol, timeframe, market_type)
+        is_new_watch = key not in self._chart_watch
+        self._chart_watch[key] = time.monotonic()
+        if is_new_watch:
+            self._update_stream_subscriptions()
+
+        if self._default_adapter is None:
+            self._default_adapter = BinanceAdapter(api_key="", api_secret="", is_testnet=False)
+        buffer = self._get_buffer(symbol, timeframe, market_type, min_size=limit + 50)
+        if buffer.count < limit:
+            await self._ensure_warm(buffer, symbol, timeframe, market_type, limit)
+            self._chart_rest_at[key] = time.monotonic()
+        elif not self._stream_fresh(symbol, timeframe, market_type):
+            if time.monotonic() - self._chart_rest_at.get(key, 0.0) >= CHART_REST_REFRESH_SEC:
+                self._chart_rest_at[key] = time.monotonic()
+                try:
+                    for c in await self._default_adapter.fetch_ohlcv(
+                        symbol=symbol, market_type=market_type, timeframe=timeframe, limit=3
+                    ):
+                        buffer.update_or_append(c)
+                except Exception as exc:
+                    logger.debug("Chart refresh for %s %s failed: %s", symbol, timeframe, exc)
+        return buffer.to_dict_list()[-limit:]
 
     async def _evaluate_active_strategies(self) -> None:
         """Refresh strategies; poll symbols whose stream is stale and catch up on missed closes."""
@@ -995,7 +1062,9 @@ class ContinuousStrategyRunner:
         # Execute in paper broker
         side = OrderSide.BUY if sig.side == PositionSide.LONG else OrderSide.SELL
         order_req = NormalizedOrderRequest(
-            client_order_id=f"cid-{sig.strategy_id[:8]}-{datetime.now(timezone.utc).strftime('%H%M%S')}",
+            # Unique per order: the old `cid-{strategy}-{HHMMSS}` collided when one strategy
+            # filled two symbols in the same second, and the second trade was never saved.
+            client_order_id=f"cid-{sig.strategy_id[:8]}-{uuid.uuid4().hex[:20]}",
             symbol=sig.symbol,
             market_type=sig.market_type,
             side=side,

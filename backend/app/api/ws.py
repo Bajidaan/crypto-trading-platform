@@ -58,6 +58,7 @@ class WebSocketHub:
                 payload["data"] = {
                     "symbol": event.symbol,
                     "timeframe": event.timeframe,
+                    "market_type": event.market_type.value,
                     "time": int(event.open_time.timestamp()),
                     "timestamp": event.open_time.isoformat(),
                     "open": float(event.open),

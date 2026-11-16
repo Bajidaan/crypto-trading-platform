@@ -3,9 +3,14 @@
 import asyncio
 import asyncio.proactor_events
 import inspect
+import os
 import signal
 import sys
 from typing import Any
+
+# The sandbox hooks below remove the event loop's self-pipe, so aiosqlite's worker thread
+# could never wake the loop. Tests therefore run SQLite inline; the app itself does not.
+os.environ.setdefault("SQLITE_INLINE_MODE", "1")
 
 
 class _DummySelfSocket:

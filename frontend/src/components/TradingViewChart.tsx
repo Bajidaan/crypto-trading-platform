@@ -163,7 +163,9 @@ export const TradingViewChart: React.FC<ChartProps> = ({
     };
 
     fetchCandles();
-    const pollInterval = setInterval(fetchCandles, 5000);
+    // Live updates arrive as `candle` messages on the dashboard WebSocket; this slow REST
+    // poll only re-syncs after a dropped connection. The backend answers it from memory.
+    const pollInterval = setInterval(fetchCandles, 30000);
 
     // Handle container resize
     const handleResize = () => {
@@ -187,7 +189,13 @@ export const TradingViewChart: React.FC<ChartProps> = ({
   // Subscribe to real-time websocket updates
   useEffect(() => {
     const handleCandleUpdate = (msg: any) => {
-      if (msg.data?.symbol === symbol && candleSeriesRef.current && volumeSeriesRef.current) {
+      // The engine streams several timeframes (and spot as well as futures) per symbol; only
+      // the bar series this chart shows may be drawn, or a 15m bar lands on a 1h chart.
+      const sameSeries =
+        msg.data?.symbol === symbol &&
+        (msg.data?.timeframe === undefined || msg.data.timeframe === timeframe) &&
+        (msg.data?.market_type === undefined || msg.data.market_type === 'FUTURES_USDT');
+      if (sameSeries && candleSeriesRef.current && volumeSeriesRef.current) {
         const c = msg.data;
         const timeSec = typeof c.time === 'number' ? c.time : Math.floor(new Date(c.timestamp || c.time).getTime() / 1000);
         if (!isNaN(timeSec)) {
@@ -217,7 +225,7 @@ export const TradingViewChart: React.FC<ChartProps> = ({
       unsubCandle();
       unsubKline();
     };
-  }, [symbol]);
+  }, [symbol, timeframe]);
 
   return (
     <div className="bg-darkpanel border border-darkborder rounded-xl p-4 flex flex-col shadow-lg">

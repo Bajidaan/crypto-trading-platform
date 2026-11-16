@@ -2,6 +2,8 @@
 
 from collections.abc import AsyncGenerator
 from functools import partial
+import os
+from pathlib import Path
 from typing import Any
 import aiosqlite.core
 from sqlalchemy import event
@@ -17,12 +19,13 @@ from app.config import get_settings
 
 
 def _configure_aiosqlite_inline_mode() -> None:
-    """Configure aiosqlite Connection to execute in-process SQLite operations inline.
+    """Make aiosqlite run SQLite calls directly on the event loop instead of its worker thread.
 
-    On Windows environments with strict loopback socket sandboxing, aiosqlite's
-    background worker thread hangs on `loop.call_soon_threadsafe()` (which uses
-    a TCP loopback socketpair). Running local embedded SQLite operations inline
-    eliminates cross-thread loopback wakeups and thread-switching overhead.
+    ONLY for sandboxes where the event loop's loopback self-pipe is blocked, so aiosqlite's
+    thread can never wake the loop (the test suite's conftest is one). Never enable it for
+    the trading engine: every query and commit then freezes the whole process, including
+    the Binance kline stream and order placement (measured 3 ms median, 13 ms p99 per
+    write). Enabled only when SQLITE_INLINE_MODE=1.
     """
     if getattr(aiosqlite.core.Connection, "_inline_patched", False):
         return
@@ -72,7 +75,8 @@ def _configure_aiosqlite_inline_mode() -> None:
     aiosqlite.core.Connection._inline_patched = True  # type: ignore[attr-defined]
 
 
-_configure_aiosqlite_inline_mode()
+if os.environ.get("SQLITE_INLINE_MODE", "").strip().lower() in ("1", "true", "yes"):
+    _configure_aiosqlite_inline_mode()
 
 
 class Base(DeclarativeBase):
@@ -108,13 +112,52 @@ def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessio
     )
 
 
+MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+BASELINE_REVISION = "0001"
+
+
+def _upgrade_schema(sync_conn: Any) -> None:
+    """Apply Alembic migrations on an open connection.
+
+    A database created before migrations existed (tables present, no alembic_version
+    table) matches the baseline revision, so it is stamped at the baseline first and
+    then upgraded like any other.
+    """
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import inspect
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(MIGRATIONS_DIR))
+    cfg.attributes["connection"] = sync_conn
+
+    tables = set(inspect(sync_conn).get_table_names())
+    if "alembic_version" not in tables and "positions" in tables:
+        command.stamp(cfg, BASELINE_REVISION)
+    command.upgrade(cfg, "head")
+
+
 async def init_database(engine: AsyncEngine) -> None:
-    """Create all database tables and seed the singleton GlobalRiskState row if absent."""
+    """Bring the schema up to date with migrations and seed the singleton GlobalRiskState row."""
     from sqlalchemy import select
     from app.models.entities import GlobalRiskState
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    async with engine.connect() as conn:
+        is_sqlite = conn.dialect.name == "sqlite"
+        if is_sqlite:
+            # SQLite migrations rebuild tables (create copy, drop original, rename). With
+            # foreign keys on, dropping `positions` would cascade-delete its orders. The
+            # pragma is ignored inside a transaction, so it is set before one starts and
+            # restored on this same connection afterwards.
+            await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            await conn.commit()
+        try:
+            await conn.run_sync(_upgrade_schema)
+            await conn.commit()
+        finally:
+            if is_sqlite:
+                await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                await conn.commit()
 
     session_factory = build_session_factory(engine)
     async with session_factory() as session:

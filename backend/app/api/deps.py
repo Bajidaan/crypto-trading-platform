@@ -107,3 +107,7 @@ async def get_stream_manager() -> MarketStreamManager:
 
 async def get_adapter_factory() -> ExchangeAdapterFactory:
     return get_app_state().adapter_factory
+
+
+async def get_strategy_runner() -> ContinuousStrategyRunner:
+    return get_app_state().strategy_runner

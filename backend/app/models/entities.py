@@ -11,7 +11,6 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
-    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -19,6 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.types import ExactDecimal
 from app.models.enums import (
     ExchangeId,
     ExecutionMode,
@@ -57,10 +57,10 @@ class ExchangeConnection(Base):
     passphrase_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_testnet: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     spot_capital_cap_usd: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("1000.0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("1000.0"), nullable=False
     )
     futures_capital_cap_usd: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("1000.0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("1000.0"), nullable=False
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -122,8 +122,8 @@ class TradeSignalRecord(Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     market_type: Mapped[str] = mapped_column(String(24), nullable=False)
     side: Mapped[str] = mapped_column(String(12), nullable=False)
-    signal_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12), nullable=True)
-    stop_loss_price: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    signal_price: Mapped[Decimal | None] = mapped_column(ExactDecimal(28, 12), nullable=True)
+    stop_loss_price: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
     take_profit_targets: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     status: Mapped[str] = mapped_column(
         String(24), default=SignalStatus.PENDING.value, nullable=False, index=True
@@ -161,23 +161,23 @@ class Position(Base):
         String(16), default=MarginMode.ISOLATED.value, nullable=False
     )
     leverage: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    entry_price: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    initial_qty: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    current_qty: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    stop_loss_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12), nullable=True)
+    entry_price: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    initial_qty: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    current_qty: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    stop_loss_price: Mapped[Decimal | None] = mapped_column(ExactDecimal(28, 12), nullable=True)
     active_stop_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     stop_order_live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    trailing_stop_pct: Mapped[Decimal | None] = mapped_column(Numeric(28, 12), nullable=True)
-    highest_or_lowest_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12), nullable=True)
+    trailing_stop_pct: Mapped[Decimal | None] = mapped_column(ExactDecimal(28, 12), nullable=True)
+    highest_or_lowest_price: Mapped[Decimal | None] = mapped_column(ExactDecimal(28, 12), nullable=True)
     take_profit_state: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     realized_pnl_usd: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("0"), nullable=False
     )
     unrealized_pnl_usd: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("0"), nullable=False
     )
     total_fees_usd: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("0"), nullable=False
     )
     status: Mapped[str] = mapped_column(
         String(24), default=PositionStatus.OPEN.value, nullable=False, index=True
@@ -221,15 +221,15 @@ class Order(Base):
     )
     side: Mapped[str] = mapped_column(String(12), nullable=False)
     reduce_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    requested_qty: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    requested_qty: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
     filled_qty: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("0"), nullable=False
     )
-    requested_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12), nullable=True)
-    stop_trigger_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12), nullable=True)
-    avg_fill_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 12), nullable=True)
+    requested_price: Mapped[Decimal | None] = mapped_column(ExactDecimal(28, 12), nullable=True)
+    stop_trigger_price: Mapped[Decimal | None] = mapped_column(ExactDecimal(28, 12), nullable=True)
+    avg_fill_price: Mapped[Decimal | None] = mapped_column(ExactDecimal(28, 12), nullable=True)
     fee_usd: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("0"), nullable=False
     )
     status: Mapped[str] = mapped_column(
         String(24), default=OrderStatus.PENDING_SUBMIT.value, nullable=False, index=True
@@ -251,7 +251,9 @@ class Fill(Base):
 
     __tablename__ = "fills"
     __table_args__ = (
-        UniqueConstraint("exchange_trade_id", name="uq_fills_exchange_trade_id"),
+        # Binance trade ids are unique per symbol, not globally: a BTC and an ETH fill can
+        # share one. A trade belongs to exactly one order, so (order, trade id) is unique.
+        UniqueConstraint("order_id", "exchange_trade_id", name="uq_fills_order_trade"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
@@ -259,10 +261,10 @@ class Fill(Base):
         String(36), ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True
     )
     exchange_trade_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    fill_price: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    fill_qty: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    fill_price: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    fill_qty: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
     fee_amount: Mapped[Decimal] = mapped_column(
-        Numeric(28, 12), default=Decimal("0"), nullable=False
+        ExactDecimal(28, 12), default=Decimal("0"), nullable=False
     )
     fee_currency: Mapped[str] = mapped_column(String(16), default="USDT", nullable=False)
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False)
@@ -292,11 +294,11 @@ class OhlcvCandle(Base):
     market_type: Mapped[str] = mapped_column(String(24), nullable=False)
     timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
     open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    open: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    high: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    low: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    close: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
-    volume: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    open: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    high: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    low: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    close: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
+    volume: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
 
 
 class BacktestRun(Base):
@@ -312,7 +314,7 @@ class BacktestRun(Base):
     timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
     start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    initial_capital_usd: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+    initial_capital_usd: Mapped[Decimal] = mapped_column(ExactDecimal(28, 12), nullable=False)
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     equity_curve: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
@@ -330,11 +332,11 @@ class GlobalRiskState(Base):
     kill_switch_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     max_concurrent_positions: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     max_daily_drawdown_pct: Mapped[Decimal] = mapped_column(
-        Numeric(10, 4), default=Decimal("5.0"), nullable=False
+        ExactDecimal(10, 4), default=Decimal("5.0"), nullable=False
     )
     max_leverage_cap: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
     default_risk_per_trade_pct: Mapped[Decimal] = mapped_column(
-        Numeric(10, 4), default=Decimal("1.0"), nullable=False
+        ExactDecimal(10, 4), default=Decimal("1.0"), nullable=False
     )
     compounding_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
