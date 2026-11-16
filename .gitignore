@@ -32,6 +32,7 @@ data/
 backend/trading_platform.db*
 
 # Environment secrets
+vault.key
 .env
 .env.*
 !.env.example

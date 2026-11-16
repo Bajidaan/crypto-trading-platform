@@ -223,6 +223,12 @@ class StubAdapterFactory:
         self.created += 1
         return self.by_connection.get(connection.id, self.adapter)
 
+    def create_direct(self, **kwargs: Any) -> IExchangeAdapter:
+        """Used when a new key is checked before saving. `direct` can return a per-call adapter."""
+        self.direct_calls = getattr(self, "direct_calls", []) + [kwargs]
+        direct = getattr(self, "direct", None)
+        return direct(**kwargs) if direct else self.adapter
+
 
 class CountingStrategy(IStrategy):
     """Emits a configurable list of signals on every closed bar and counts its evaluations."""

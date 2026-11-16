@@ -33,6 +33,7 @@ from app.core.events import (
 )
 from app.domains.cex.adapters.base import (
     CandleBar,
+    ExchangeAuthenticationError,
     IExchangeAdapter,
     MarketRules,
 )
@@ -172,6 +173,74 @@ class ContinuousStrategyRunner:
 
     def last_price(self, symbol: str, market_type: MarketType) -> Decimal | None:
         return self._last_price.get((symbol, market_type))
+
+    # ================================================================== API keys
+
+    async def _probe_key(self, api_key: str, api_secret: str, environment: TradingEnvironment) -> dict[str, Any]:
+        """Try a signed balance read with a key on one environment's servers."""
+        adapter = self.adapter_factory.create_direct(
+            exchange_id=ExchangeId.BINANCE,
+            api_key=api_key,
+            api_secret=api_secret,
+            is_testnet=environment == TradingEnvironment.DEMO,
+        )
+        balances: dict[str, Decimal] = {}
+        auth_errors: list[str] = []
+        other_errors: list[str] = []
+        try:
+            try:
+                await adapter.sync_server_time(MarketType.FUTURES_USDT)
+            except Exception:
+                pass  # the balance calls below report reachability
+            for mt in (MarketType.FUTURES_USDT, MarketType.SPOT):
+                try:
+                    balances[mt.value] = (await adapter.fetch_balance(mt)).total_equity
+                except ExchangeAuthenticationError as exc:
+                    auth_errors.append(f"{mt.value}: {exc}")
+                except Exception as exc:
+                    other_errors.append(f"{mt.value}: {exc}")
+        finally:
+            await adapter.close()
+        return {
+            "ok": bool(balances),
+            "balances": balances,
+            "rejected": not balances and bool(auth_errors),
+            "errors": auth_errors + other_errors,
+        }
+
+    async def verify_api_key(
+        self, api_key: str, api_secret: str, environment: TradingEnvironment
+    ) -> dict[str, Any]:
+        """Check a key with Binance before it is saved.
+
+        Returns ok, the balances it can read, and when Binance rejects it on the chosen
+        environment, `belongs_to`: the other environment if the key works there instead
+        (e.g. a real-account key entered as Demo).
+        """
+        env = TradingEnvironment(environment)
+        result = await self._probe_key(api_key, api_secret, env)
+        result["belongs_to"] = None
+        if result["rejected"]:
+            other = TradingEnvironment.LIVE if env == TradingEnvironment.DEMO else TradingEnvironment.DEMO
+            if (await self._probe_key(api_key, api_secret, other))["ok"]:
+                result["belongs_to"] = other.value
+        return result
+
+    async def refresh_account(self) -> None:
+        """Re-read the active environment's balance now (e.g. right after a key was added)."""
+        await self._refresh_account()
+
+    async def forget_connection(self, connection_id: str) -> None:
+        """Drop the cached exchange client of a removed API key."""
+        adapter = self._live_adapters.pop(connection_id, None)
+        self._live_conn_caps.pop(connection_id, None)
+        if adapter is not None:
+            try:
+                await adapter.close()
+            except Exception:
+                pass
+        if self._account.get("connection_id") == connection_id:
+            self._account = {}
 
     @property
     def account(self) -> dict[str, Any]:

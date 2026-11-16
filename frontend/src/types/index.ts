@@ -85,9 +85,14 @@ export interface ConnectionItem {
   environment: TradingEnvironment;
   is_testnet: boolean;
   is_active: boolean;
+  // The key the engine trades with on its account (the newest one).
+  in_use: boolean;
   spot_capital_cap_usd: number | null;
   futures_capital_cap_usd: number | null;
   created_at: string;
+  // Only returned when a key is added: balances Binance reported, and caveats.
+  balances?: Record<string, number>;
+  warnings?: string[];
 }
 
 export interface OHLCVCandle {

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings, get_settings
 from app.core.database import build_async_engine, build_session_factory
 from app.core.events import EventBus
-from app.core.security import CredentialVault
+from app.core.security import CredentialVault, build_credential_vault
 from app.domains.cex.adapters.factory import ExchangeAdapterFactory
 from app.domains.cex.execution.live_broker import LiveExecutionBroker
 from app.domains.cex.execution.runner import ContinuousStrategyRunner
@@ -26,7 +26,9 @@ class AppState:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.vault = CredentialVault(master_secret=settings.master_vault_secret)
+        self.vault = build_credential_vault(
+            settings.master_vault_secret, settings.database_url, settings.vault_key_file
+        )
         self.event_bus = EventBus()
         self.engine = build_async_engine(settings.database_url)
         self.session_factory = build_session_factory(self.engine)

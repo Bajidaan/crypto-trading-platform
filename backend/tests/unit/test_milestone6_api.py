@@ -21,6 +21,10 @@ async def create_test_client():
     )
     app_state = AppState(settings)
     await init_database(app_state.engine)
+    # API keys are checked with the exchange on save; never reach the real Binance from tests.
+    from tests.unit.test_milestone8_live_execution import LiveMockAdapter, StubAdapterFactory
+
+    app_state.strategy_runner.adapter_factory = StubAdapterFactory(LiveMockAdapter())  # type: ignore[assignment]
     set_app_state(app_state)
 
     app = create_app()

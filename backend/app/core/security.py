@@ -3,12 +3,17 @@
 import base64
 import hashlib
 import hmac
+import logging
 import os
+from pathlib import Path
+import secrets
 import time
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+logger = logging.getLogger(__name__)
 
 
 class VaultDecryptionError(Exception):
@@ -31,19 +36,22 @@ class CredentialVault:
     KEY_LENGTH = 32  # 256 bits
     KDF_ITERATIONS = 200_000
 
-    def __init__(self, master_secret: str) -> None:
+    def __init__(self, master_secret: str, fallback_secrets: list[str] | None = None) -> None:
         if not master_secret or len(master_secret.strip()) < 16:
             raise ValueError("Master vault secret must be at least 16 characters long.")
         self._master_secret_bytes = master_secret.encode("utf-8")
+        # Older secrets that may still decrypt rows saved before a secret change. Never used
+        # to encrypt.
+        self._fallback_secret_bytes = [s.encode("utf-8") for s in (fallback_secrets or []) if s]
 
-    def _derive_key(self, salt: bytes) -> bytes:
+    def _derive_key(self, salt: bytes, secret: bytes | None = None) -> bytes:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=self.KEY_LENGTH,
             salt=salt,
             iterations=self.KDF_ITERATIONS,
         )
-        return kdf.derive(self._master_secret_bytes)
+        return kdf.derive(secret or self._master_secret_bytes)
 
     def encrypt(self, plaintext: str, associated_data: str | None = None) -> str:
         """Encrypt a plaintext string using AES-256-GCM with a fresh random salt and nonce."""
@@ -74,16 +82,62 @@ class CredentialVault:
         nonce = raw[self.SALT_LENGTH : self.SALT_LENGTH + self.NONCE_LENGTH]
         ciphertext = raw[self.SALT_LENGTH + self.NONCE_LENGTH :]
 
-        key = self._derive_key(salt)
-        aesgcm = AESGCM(key)
         aad = associated_data.encode("utf-8") if associated_data else None
-        try:
-            plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, aad)
-            return plaintext_bytes.decode("utf-8")
-        except InvalidTag as exc:
-            raise VaultDecryptionError(
-                "Credential authentication failed: wrong master secret, mismatched AAD, or tampered ciphertext."
-            ) from exc
+        for secret in [self._master_secret_bytes, *self._fallback_secret_bytes]:
+            aesgcm = AESGCM(self._derive_key(salt, secret))
+            try:
+                return aesgcm.decrypt(nonce, ciphertext, aad).decode("utf-8")
+            except InvalidTag:
+                continue
+        raise VaultDecryptionError(
+            "Credential authentication failed: wrong master secret, mismatched AAD, or tampered ciphertext."
+        )
+
+
+# The built-in development secret. It is in the public source code, so anything encrypted
+# with it is readable by anyone holding the database file.
+DEFAULT_DEV_VAULT_SECRET = "dev-only-change-in-production-master-vault-secret-32b!"
+
+
+def _default_vault_key_path(database_url: str) -> Path:
+    """Next to the SQLite database (on the Docker data volume), else the working folder."""
+    if database_url.startswith("sqlite") and ":///" in database_url:
+        db_path = database_url.split(":///", 1)[1]
+        if db_path and db_path != ":memory:":
+            return Path(db_path).expanduser().resolve().parent / "vault.key"
+    return Path("vault.key").resolve()
+
+
+def load_or_create_vault_secret(path: Path) -> str:
+    """Read the machine-local vault secret, creating a random one on first use."""
+    if path.exists():
+        secret = path.read_text(encoding="utf-8").strip()
+        if len(secret) >= 32:
+            return secret
+        raise ValueError(f"Vault key file {path} is too short; restore it from a backup.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    secret = secrets.token_urlsafe(48)
+    # Create exclusively so two processes starting together cannot write different secrets.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(secret)
+    logger.warning(
+        "Created a new API key vault secret at %s. Back it up: without it saved API keys cannot be read.", path
+    )
+    return secret
+
+
+def build_credential_vault(
+    master_vault_secret: str, database_url: str, vault_key_file: str | None = None
+) -> CredentialVault:
+    """The app's vault: an explicit MASTER_VAULT_SECRET, or else a random secret kept in a
+    local file (vault.key, never committed). The public development secret is only accepted
+    as a fallback, to read keys that were saved with it before.
+    """
+    if master_vault_secret and master_vault_secret != DEFAULT_DEV_VAULT_SECRET:
+        return CredentialVault(master_vault_secret, fallback_secrets=[DEFAULT_DEV_VAULT_SECRET])
+    path = Path(vault_key_file).expanduser().resolve() if vault_key_file else _default_vault_key_path(database_url)
+    return CredentialVault(load_or_create_vault_secret(path), fallback_secrets=[DEFAULT_DEV_VAULT_SECRET])
 
 
 def mask_api_key(api_key: str) -> str:

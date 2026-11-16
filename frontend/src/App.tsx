@@ -215,16 +215,20 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleAddConnection = async (payload: any) => {
+  // Reload the list after a change: which key is "in use" for an account can move.
+  const reloadConnections = () => api.getConnections().then(setConnections).catch(() => {});
+
+  const handleAddConnection = async (payload: any): Promise<ConnectionItem> => {
     const conn = await api.createConnection(payload);
-    setConnections((prev) => [conn, ...prev]);
+    await reloadConnections();
     // A new key can change the active account's balance and label in the header.
     api.getSystemStatus().then(applyStatus).catch(() => {});
+    return conn;
   };
 
   const handleDeleteConnection = async (id: string) => {
     await api.deleteConnection(id);
-    setConnections((prev) => prev.filter((c) => c.id !== id));
+    await reloadConnections();
     api.getSystemStatus().then(applyStatus).catch(() => {});
   };
 
@@ -280,6 +284,7 @@ export const App: React.FC = () => {
         isOpen={isConnectionsOpen}
         onClose={() => setIsConnectionsOpen(false)}
         connections={connections}
+        activeEnvironment={status?.environment ?? 'DEMO'}
         onAddConnection={handleAddConnection}
         onDeleteConnection={handleDeleteConnection}
       />

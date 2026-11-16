@@ -31,7 +31,14 @@ class Settings(BaseSettings):
     master_vault_secret: str = Field(
         default="dev-only-change-in-production-master-vault-secret-32b!",
         min_length=16,
-        description="Master secret used to derive AES-256-GCM encryption keys for API credentials",
+        description=(
+            "Master secret for encrypting exchange API keys. Left at this public default, the app "
+            "instead generates a random secret in a local vault.key file (see vault_key_file)."
+        ),
+    )
+    vault_key_file: str | None = Field(
+        default=None,
+        description="Where the generated vault secret lives. Default: next to the SQLite database.",
     )
     webhook_hmac_secret: str = Field(
         default="dev-only-change-in-production-webhook-hmac-secret!",
